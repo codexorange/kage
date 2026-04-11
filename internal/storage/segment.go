@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -26,6 +27,14 @@ const (
 // ErrSegmentFull is returned by Append when the segment has reached its
 // maximum configured size. The caller should open a new segment.
 var ErrSegmentFull = errors.New("segment is full")
+
+// ErrInvalidOffset is returned by Read when offset is out of the segment's
+// written range.
+var ErrInvalidOffset = errors.New("storage: offset out of range")
+
+// ErrInvalidSize is returned by Read when size is ≤ 0 or the requested range
+// [offset, offset+size) exceeds the segment's written data.
+var ErrInvalidSize = errors.New("storage: invalid read size")
 
 // Segment is an append-only, length-prefixed log file.
 //
@@ -182,6 +191,55 @@ func (s *Segment) ReadAt(offset uint64) ([]byte, error) {
 		return nil, fmt.Errorf("storage: read record payload at %d: %w", offset, err)
 	}
 	return payload, nil
+}
+
+// Read returns a zero-copy view of [offset, offset+size) in the .log file as
+// an *io.SectionReader.
+//
+// *io.SectionReader wraps s.file (an *os.File, which implements io.ReaderAt)
+// with a fixed [offset, offset+size) window. No bytes are read or copied into
+// Go heap memory at this point.
+//
+// The intended use is to pass the returned reader directly to io.Copy with a
+// net.Conn as destination:
+//
+//	r, _ := seg.Read(offset, size)
+//	io.Copy(conn, r)
+//
+// On Linux (the production target, as defined by the Docker image), Go's
+// runtime detects that the underlying source is an *os.File via the
+// syscall.Conn interface and substitutes the copy with a sendfile(2) syscall,
+// transferring data directly from the page cache to the socket buffer.
+//
+// The lock is released before returning — reads from the SectionReader do not
+// hold Segment.mu, so concurrent Append calls are not blocked.
+//
+// The caller must not use the returned reader after the Segment is closed.
+func (s *Segment) Read(offset uint64, size int32) (io.Reader, error) {
+	if size <= 0 {
+		return nil, ErrInvalidSize
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if int64(offset) >= s.size {
+		return nil, ErrInvalidOffset
+	}
+	if int64(offset)+int64(size) > s.size {
+		return nil, ErrInvalidSize
+	}
+
+	// Flush so any buffered-but-not-yet-written bytes are visible to pread(2)
+	// calls that the SectionReader will issue via file.ReadAt.
+	if err := s.bw.Flush(); err != nil {
+		return nil, fmt.Errorf("storage: flush before read: %w", err)
+	}
+
+	// io.NewSectionReader builds a stateless window over s.file.
+	// s.file is an *os.File → implements io.ReaderAt via pread(2).
+	// No allocation beyond the 40-byte SectionReader struct itself.
+	return io.NewSectionReader(s.file, int64(offset), int64(size)), nil
 }
 
 // Size returns the number of bytes written to the segment (including any
