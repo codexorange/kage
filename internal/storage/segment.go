@@ -1,0 +1,187 @@
+package storage
+
+import (
+	"bufio"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
+)
+
+const (
+	// DefaultMaxSegmentSize is 1 GiB — the maximum bytes a single segment file
+	// may hold before the caller must roll over to a new segment.
+	DefaultMaxSegmentSize = 1 << 30 // 1 GiB
+
+	// recordHeaderSize is the number of bytes used to encode the payload length
+	// that precedes every record on disk: uint32 big-endian.
+	recordHeaderSize = 4
+
+	// writeBufferSize is the capacity of the in-memory bufio.Writer.
+	writeBufferSize = 256 << 10 // 256 KiB
+)
+
+// ErrSegmentFull is returned by Append when the segment has reached its
+// maximum configured size. The caller should open a new segment.
+var ErrSegmentFull = errors.New("segment is full")
+
+// Segment is an append-only, length-prefixed log file.
+//
+// On-disk record layout:
+//
+//	┌────────────────────┬───────────────────┐
+//	│ length  (uint32 BE)│ payload  (N bytes)│
+//	└────────────────────┴───────────────────┘
+//
+// The offset returned by Append is the byte position of the length field
+// within the file, so readers can seek directly to any previously appended
+// record.
+//
+// Segment is safe for concurrent use.
+type Segment struct {
+	mu      sync.Mutex
+	file    *os.File
+	bw      *bufio.Writer
+	baseOffset uint64 // first logical offset this segment covers
+	size    int64  // bytes written to the file (including buffered)
+	maxSize int64
+}
+
+// SegmentConfig holds optional parameters for OpenSegment.
+type SegmentConfig struct {
+	// MaxSize is the maximum number of bytes the segment file may grow to.
+	// Defaults to DefaultMaxSegmentSize when zero.
+	MaxSize int64
+}
+
+// OpenSegment opens or creates a segment file in dir.
+//
+//   - baseOffset identifies the segment; the filename encodes it as a
+//     zero-padded 20-digit decimal number with a ".log" extension.
+//   - If the file already exists its current size is used as the starting
+//     write cursor (append-mode resume).
+func OpenSegment(dir string, baseOffset uint64, cfg SegmentConfig) (*Segment, error) {
+	if cfg.MaxSize <= 0 {
+		cfg.MaxSize = DefaultMaxSegmentSize
+	}
+
+	name := filepath.Join(dir, fmt.Sprintf("%020d.log", baseOffset))
+	f, err := os.OpenFile(name, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("storage: open segment %q: %w", name, err)
+	}
+
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, fmt.Errorf("storage: stat segment %q: %w", name, err)
+	}
+
+	return &Segment{
+		file:       f,
+		bw:         bufio.NewWriterSize(f, writeBufferSize),
+		baseOffset: baseOffset,
+		size:       info.Size(),
+		maxSize:    cfg.MaxSize,
+	}, nil
+}
+
+// Append writes payload to the segment and returns the byte offset at which
+// the record's length header was written.
+//
+// Returns ErrSegmentFull (without writing anything) when the segment cannot
+// accommodate the record without exceeding maxSize.
+func (s *Segment) Append(payload []byte) (offset uint64, err error) {
+	recordSize := int64(recordHeaderSize + len(payload))
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.size+recordSize > s.maxSize {
+		return 0, ErrSegmentFull
+	}
+
+	offset = uint64(s.size)
+
+	var hdr [recordHeaderSize]byte
+	binary.BigEndian.PutUint32(hdr[:], uint32(len(payload)))
+
+	if _, err = s.bw.Write(hdr[:]); err != nil {
+		return 0, fmt.Errorf("storage: write record header: %w", err)
+	}
+	if _, err = s.bw.Write(payload); err != nil {
+		return 0, fmt.Errorf("storage: write record payload: %w", err)
+	}
+
+	s.size += recordSize
+	return offset, nil
+}
+
+// Flush commits all buffered writes to the underlying OS file.
+// It does NOT call fsync; durability is the caller's responsibility.
+func (s *Segment) Flush() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.bw.Flush(); err != nil {
+		return fmt.Errorf("storage: flush segment: %w", err)
+	}
+	return nil
+}
+
+// ReadAt reads the record that was written at the given byte offset.
+// It flushes buffered data first so recently appended records are visible.
+func (s *Segment) ReadAt(offset uint64) ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Flush so the kernel buffer has the latest data.
+	if err := s.bw.Flush(); err != nil {
+		return nil, fmt.Errorf("storage: flush before read: %w", err)
+	}
+
+	var hdr [recordHeaderSize]byte
+	if _, err := s.file.ReadAt(hdr[:], int64(offset)); err != nil {
+		return nil, fmt.Errorf("storage: read record header at %d: %w", offset, err)
+	}
+
+	length := binary.BigEndian.Uint32(hdr[:])
+	if length == 0 {
+		return []byte{}, nil
+	}
+
+	payload := make([]byte, length)
+	if _, err := s.file.ReadAt(payload, int64(offset)+recordHeaderSize); err != nil {
+		return nil, fmt.Errorf("storage: read record payload at %d: %w", offset, err)
+	}
+	return payload, nil
+}
+
+// Size returns the number of bytes written to the segment (including any
+// data still in the write buffer).
+func (s *Segment) Size() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.size
+}
+
+// BaseOffset returns the logical base offset this segment was opened with.
+func (s *Segment) BaseOffset() uint64 {
+	return s.baseOffset
+}
+
+// Close flushes buffered writes and closes the underlying file.
+func (s *Segment) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.bw.Flush(); err != nil {
+		return fmt.Errorf("storage: flush on close: %w", err)
+	}
+	if err := s.file.Close(); err != nil {
+		return fmt.Errorf("storage: close segment file: %w", err)
+	}
+	return nil
+}
