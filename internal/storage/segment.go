@@ -39,14 +39,18 @@ var ErrSegmentFull = errors.New("segment is full")
 // within the file, so readers can seek directly to any previously appended
 // record.
 //
+// Each Segment owns a paired *Index.  A sparse index entry is written
+// automatically every IndexIntervalBytes of log data.
+//
 // Segment is safe for concurrent use.
 type Segment struct {
-	mu      sync.Mutex
-	file    *os.File
-	bw      *bufio.Writer
+	mu         sync.Mutex
+	file       *os.File
+	bw         *bufio.Writer
+	idx        *Index
 	baseOffset uint64 // first logical offset this segment covers
-	size    int64  // bytes written to the file (including buffered)
-	maxSize int64
+	size       int64  // bytes written to the file (including buffered)
+	maxSize    int64
 }
 
 // SegmentConfig holds optional parameters for OpenSegment.
@@ -79,9 +83,16 @@ func OpenSegment(dir string, baseOffset uint64, cfg SegmentConfig) (*Segment, er
 		return nil, fmt.Errorf("storage: stat segment %q: %w", name, err)
 	}
 
+	idx, err := openIndex(dir, baseOffset)
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+
 	return &Segment{
 		file:       f,
 		bw:         bufio.NewWriterSize(f, writeBufferSize),
+		idx:        idx,
 		baseOffset: baseOffset,
 		size:       info.Size(),
 		maxSize:    cfg.MaxSize,
@@ -116,11 +127,16 @@ func (s *Segment) Append(payload []byte) (offset uint64, err error) {
 	}
 
 	s.size += recordSize
+
+	if err = s.idx.maybeAppend(offset, uint32(offset), recordSize); err != nil {
+		return 0, fmt.Errorf("storage: update index: %w", err)
+	}
+
 	return offset, nil
 }
 
-// Flush commits all buffered writes to the underlying OS file.
-// It does NOT call fsync; durability is the caller's responsibility.
+// Flush commits all buffered writes — both log and index — to the underlying
+// OS files.  It does NOT call fsync; durability is the caller's responsibility.
 func (s *Segment) Flush() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -128,7 +144,16 @@ func (s *Segment) Flush() error {
 	if err := s.bw.Flush(); err != nil {
 		return fmt.Errorf("storage: flush segment: %w", err)
 	}
+	if err := s.idx.Flush(); err != nil {
+		return err
+	}
 	return nil
+}
+
+// Index returns the sparse Index associated with this segment.
+// The returned pointer must not be used concurrently with Append.
+func (s *Segment) Index() *Index {
+	return s.idx
 }
 
 // ReadAt reads the record that was written at the given byte offset.
@@ -172,7 +197,7 @@ func (s *Segment) BaseOffset() uint64 {
 	return s.baseOffset
 }
 
-// Close flushes buffered writes and closes the underlying file.
+// Close flushes buffered writes and closes both the log and index files.
 func (s *Segment) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -182,6 +207,9 @@ func (s *Segment) Close() error {
 	}
 	if err := s.file.Close(); err != nil {
 		return fmt.Errorf("storage: close segment file: %w", err)
+	}
+	if err := s.idx.Close(); err != nil {
+		return err
 	}
 	return nil
 }
