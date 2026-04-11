@@ -11,62 +11,66 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/codexorange/kage/internal/config"
 	"github.com/codexorange/kage/internal/server"
 	"github.com/codexorange/kage/internal/storage"
-)
-
-const (
-	defaultAddr        = "0.0.0.0:9092"
-	defaultDataDir     = "/data"
-	maxConcurrentConns = 10_000
-	shutdownTimeout    = 10 * time.Second
 )
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(logger)
 
+	cfg, err := config.Load(config.DefaultConfigFile)
+	if err != nil {
+		logger.Error("failed to load configuration", "error", err)
+		os.Exit(1)
+	}
+
+	logger.Info("configuration loaded",
+		"port", cfg.Port,
+		"log_directory", cfg.LogDirectory,
+		"max_segment_size", cfg.MaxSegmentSize,
+		"worker_pool_size", cfg.WorkerPoolSize,
+		"shutdown_timeout", cfg.ShutdownTimeout,
+	)
+
 	// Root context cancelled on SIGTERM/SIGINT.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Ensure the data directory exists.
-	if err := os.MkdirAll(defaultDataDir, 0o755); err != nil {
-		logger.Error("failed to create data dir", "path", defaultDataDir, "error", err)
+	if err := os.MkdirAll(cfg.LogDirectory, 0o755); err != nil {
+		logger.Error("failed to create log directory", "path", cfg.LogDirectory, "error", err)
 		os.Exit(1)
 	}
 
-	// Open the single partition store backed by the data directory.
-	store, err := storage.OpenPartitionStore(defaultDataDir, storage.SegmentConfig{})
+	store, err := storage.OpenPartitionStore(cfg.LogDirectory, storage.SegmentConfig{
+		MaxSize: cfg.MaxSegmentSize,
+	})
 	if err != nil {
-		logger.Error("failed to open partition store", "dir", defaultDataDir, "error", err)
+		logger.Error("failed to open partition store", "dir", cfg.LogDirectory, "error", err)
 		os.Exit(1)
 	}
 	defer store.Close()
 
 	lc := net.ListenConfig{}
-	listener, err := lc.Listen(ctx, "tcp", defaultAddr)
+	listener, err := lc.Listen(ctx, "tcp", cfg.Addr())
 	if err != nil {
-		logger.Error("failed to bind listener", "error", err, "addr", defaultAddr)
+		logger.Error("failed to bind listener", "error", err, "addr", cfg.Addr())
 		os.Exit(1)
 	}
 
 	logger.Info("Kage broker started",
-		"address", defaultAddr,
-		"data_dir", defaultDataDir,
+		"address", cfg.Addr(),
+		"log_directory", cfg.LogDirectory,
 		"pid", os.Getpid(),
-		"max_conns", maxConcurrentConns,
+		"worker_pool_size", cfg.WorkerPoolSize,
 	)
 
 	handler := server.NewHandler(logger, store)
 
-	// Semaphore: limits concurrent active connections.
-	sem := make(chan struct{}, maxConcurrentConns)
-
-	// WaitGroup tracks all active connection goroutines.
+	sem := make(chan struct{}, cfg.WorkerPoolSize)
 	var wg sync.WaitGroup
 
-	// Accept loop runs until the listener is closed.
 	go func() {
 		for {
 			conn, err := listener.Accept()
@@ -83,7 +87,7 @@ func main() {
 			default:
 				logger.Warn("worker pool exhausted, rejecting connection",
 					"client", conn.RemoteAddr().String(),
-					"max_conns", maxConcurrentConns,
+					"worker_pool_size", cfg.WorkerPoolSize,
 				)
 				conn.Close()
 				continue
@@ -114,7 +118,7 @@ func main() {
 	select {
 	case <-shutdownDone:
 		logger.Info("all connections drained, Kage stopped cleanly")
-	case <-time.After(shutdownTimeout):
-		logger.Warn("shutdown timeout exceeded, forcing exit", "timeout", shutdownTimeout)
+	case <-time.After(cfg.ShutdownTimeout):
+		logger.Warn("shutdown timeout exceeded, forcing exit", "timeout", cfg.ShutdownTimeout)
 	}
 }
