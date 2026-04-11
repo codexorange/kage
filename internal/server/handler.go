@@ -1,11 +1,13 @@
 package server
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/codexorange/kage/internal/metrics"
@@ -13,15 +15,30 @@ import (
 	"github.com/codexorange/kage/internal/storage"
 )
 
+// offsetCacheKey uniquely identifies a consumer group's committed offset for
+// a single topic-partition.
+type offsetCacheKey struct {
+	GroupID   string
+	Topic     string
+	Partition int32
+}
+
 // Handler routes incoming Kafka requests to the appropriate response builder.
 type Handler struct {
-	logger  *slog.Logger
-	store   *storage.BrokerStore
-	metrics *metrics.Metrics
+	offsetMu    sync.RWMutex
+	offsetCache map[offsetCacheKey]int64
+	logger      *slog.Logger
+	store       *storage.BrokerStore
+	metrics     *metrics.Metrics
 }
 
 func NewHandler(logger *slog.Logger, store *storage.BrokerStore, m *metrics.Metrics) *Handler {
-	return &Handler{logger: logger, store: store, metrics: m}
+	return &Handler{
+		offsetCache: make(map[offsetCacheKey]int64),
+		logger:      logger,
+		store:       store,
+		metrics:     m,
+	}
 }
 
 // Handle reads requests from conn in a loop, dispatching each by ApiKey, until
@@ -69,6 +86,10 @@ func (h *Handler) dispatch(conn net.Conn, dec *protocol.Decoder, header *protoco
 		return h.handleFetch(conn, dec, header)
 	case protocol.ApiKeyMetadata:
 		return h.handleMetadata(conn, dec, header)
+	case protocol.ApiKeyOffsetCommit:
+		return h.handleOffsetCommit(conn, dec, header)
+	case protocol.ApiKeyOffsetFetch:
+		return h.handleOffsetFetch(conn, dec, header)
 	default:
 		return fmt.Errorf("unsupported api_key: %d", header.ApiKey)
 	}
@@ -312,4 +333,177 @@ func (h *Handler) handleMetadata(conn net.Conn, dec *protocol.Decoder, header *p
 		return fmt.Errorf("handleMetadata: failed to write response: %w", err)
 	}
 	return nil
+}
+
+// handleOffsetCommit processes an OffsetCommitRequest (ApiKey 8, v2).
+//
+// Each committed offset is:
+//  1. Persisted to the __consumer_offsets topic in BrokerStore by appending a
+//     record whose key encodes [groupIDLen(2)groupID topicLen(2)topic partition(4)]
+//     and whose value encodes the committed offset as a big-endian int64.
+//  2. Cached in-memory (offsetCache) for fast OffsetFetch responses.
+func (h *Handler) handleOffsetCommit(conn net.Conn, dec *protocol.Decoder, header *protocol.RequestHeader) error {
+	req, err := dec.ParseOffsetCommitRequest(header)
+	if err != nil {
+		return fmt.Errorf("handleOffsetCommit: parse: %w", err)
+	}
+
+	resp := &protocol.OffsetCommitResponse{
+		Topics: make([]protocol.OffsetCommitTopicResponse, 0, len(req.Topics)),
+	}
+
+	for _, topic := range req.Topics {
+		topicResp := protocol.OffsetCommitTopicResponse{
+			TopicName:  topic.TopicName,
+			Partitions: make([]protocol.OffsetCommitPartitionResponse, 0, len(topic.Partitions)),
+		}
+
+		for _, part := range topic.Partitions {
+			partResp := protocol.OffsetCommitPartitionResponse{
+				Partition: part.Partition,
+				ErrorCode: 0,
+			}
+
+			// Serialize key: groupIDLen(2) + groupID + topicLen(2) + topic + partition(4)
+			key := encodeOffsetKey(req.GroupID, topic.TopicName, part.Partition)
+
+			// Serialize value: committed offset as big-endian int64 (8 bytes)
+			var valueBuf [8]byte
+			binary.BigEndian.PutUint64(valueBuf[:], uint64(part.CommittedOffset))
+
+			// Build the record: key + value with simple length-prefixed framing.
+			// Format: keyLen(4) + key + valueLen(4) + value
+			record := encodeOffsetRecord(key, valueBuf[:])
+
+			ps, err := h.store.GetOrCreatePartition(protocol.ConsumerOffsetsTopic, 0)
+			if err != nil {
+				h.logger.Error("offset commit: failed to get partition store",
+					"group", req.GroupID, "topic", topic.TopicName,
+					"partition", part.Partition, "error", err,
+				)
+				partResp.ErrorCode = 1
+				topicResp.Partitions = append(topicResp.Partitions, partResp)
+				continue
+			}
+
+			if _, err := ps.Append(record); err != nil {
+				h.logger.Error("offset commit: storage append failed",
+					"group", req.GroupID, "topic", topic.TopicName,
+					"partition", part.Partition, "error", err,
+				)
+				partResp.ErrorCode = 1
+				topicResp.Partitions = append(topicResp.Partitions, partResp)
+				continue
+			}
+
+			// Update in-memory cache.
+			cacheKey := offsetCacheKey{
+				GroupID:   req.GroupID,
+				Topic:     topic.TopicName,
+				Partition: part.Partition,
+			}
+			h.offsetMu.Lock()
+			h.offsetCache[cacheKey] = part.CommittedOffset
+			h.offsetMu.Unlock()
+
+			h.logger.Info("offset commit: stored",
+				"group", req.GroupID,
+				"topic", topic.TopicName,
+				"partition", part.Partition,
+				"offset", part.CommittedOffset,
+			)
+			topicResp.Partitions = append(topicResp.Partitions, partResp)
+		}
+		resp.Topics = append(resp.Topics, topicResp)
+	}
+
+	enc := protocol.NewEncoder()
+	enc.EncodeOffsetCommitResponse(header.CorrelationID, resp)
+	if _, err := conn.Write(enc.FullMessage()); err != nil {
+		return fmt.Errorf("handleOffsetCommit: write response: %w", err)
+	}
+	return nil
+}
+
+// handleOffsetFetch processes an OffsetFetchRequest (ApiKey 9, v1).
+//
+// Offsets are served from the in-memory cache populated by handleOffsetCommit.
+// If no commit has been recorded for a group/topic/partition, OffsetUnknown (-1)
+// is returned — matching the Kafka protocol convention.
+func (h *Handler) handleOffsetFetch(conn net.Conn, dec *protocol.Decoder, header *protocol.RequestHeader) error {
+	req, err := dec.ParseOffsetFetchRequest(header)
+	if err != nil {
+		return fmt.Errorf("handleOffsetFetch: parse: %w", err)
+	}
+
+	resp := &protocol.OffsetFetchResponse{
+		Topics: make([]protocol.OffsetFetchTopicResponse, 0, len(req.Topics)),
+	}
+
+	h.offsetMu.RLock()
+	for _, topic := range req.Topics {
+		topicResp := protocol.OffsetFetchTopicResponse{
+			TopicName:  topic.TopicName,
+			Partitions: make([]protocol.OffsetFetchPartitionResponse, 0, len(topic.Partitions)),
+		}
+		for _, part := range topic.Partitions {
+			cacheKey := offsetCacheKey{
+				GroupID:   req.GroupID,
+				Topic:     topic.TopicName,
+				Partition: part.Partition,
+			}
+			offset, ok := h.offsetCache[cacheKey]
+			if !ok {
+				offset = protocol.OffsetUnknown
+			}
+			topicResp.Partitions = append(topicResp.Partitions, protocol.OffsetFetchPartitionResponse{
+				Partition:         part.Partition,
+				CommittedOffset:   offset,
+				CommittedMetadata: "",
+				ErrorCode:         0,
+			})
+		}
+		resp.Topics = append(resp.Topics, topicResp)
+	}
+	h.offsetMu.RUnlock()
+
+	enc := protocol.NewEncoder()
+	enc.EncodeOffsetFetchResponse(header.CorrelationID, resp)
+	if _, err := conn.Write(enc.FullMessage()); err != nil {
+		return fmt.Errorf("handleOffsetFetch: write response: %w", err)
+	}
+	return nil
+}
+
+// encodeOffsetKey serialises a (groupID, topic, partition) tuple into a byte
+// slice used as the key of an offset record stored in __consumer_offsets.
+// Format: groupIDLen(2) + groupID + topicLen(2) + topic + partition(4)
+func encodeOffsetKey(groupID, topic string, partition int32) []byte {
+	buf := make([]byte, 2+len(groupID)+2+len(topic)+4)
+	pos := 0
+	binary.BigEndian.PutUint16(buf[pos:], uint16(len(groupID)))
+	pos += 2
+	copy(buf[pos:], groupID)
+	pos += len(groupID)
+	binary.BigEndian.PutUint16(buf[pos:], uint16(len(topic)))
+	pos += 2
+	copy(buf[pos:], topic)
+	pos += len(topic)
+	binary.BigEndian.PutUint32(buf[pos:], uint32(partition))
+	return buf
+}
+
+// encodeOffsetRecord builds the opaque byte slice appended to __consumer_offsets.
+// Format: keyLen(4) + key + valueLen(4) + value
+func encodeOffsetRecord(key, value []byte) []byte {
+	buf := make([]byte, 4+len(key)+4+len(value))
+	pos := 0
+	binary.BigEndian.PutUint32(buf[pos:], uint32(len(key)))
+	pos += 4
+	copy(buf[pos:], key)
+	pos += len(key)
+	binary.BigEndian.PutUint32(buf[pos:], uint32(len(value)))
+	pos += 4
+	copy(buf[pos:], value)
+	return buf
 }

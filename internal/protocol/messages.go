@@ -7,10 +7,18 @@ import (
 
 // API keys
 const (
-	ApiKeyProduce  int16 = 0
-	ApiKeyFetch    int16 = 1
-	ApiKeyMetadata int16 = 3
+	ApiKeyProduce       int16 = 0
+	ApiKeyFetch         int16 = 1
+	ApiKeyMetadata      int16 = 3
+	ApiKeyOffsetCommit  int16 = 8
+	ApiKeyOffsetFetch   int16 = 9
 )
+
+// ConsumerOffsetsTopic is the internal topic used to persist consumer group offsets.
+const ConsumerOffsetsTopic = "__consumer_offsets"
+
+// OffsetUnknown is returned by OffsetFetch when no offset has been committed yet.
+const OffsetUnknown int64 = -1
 
 // Acks values for ProduceRequest.
 const (
@@ -510,6 +518,261 @@ func WriteFetchResponse(w io.Writer, correlationID int32, resp *FetchResponse) e
 		}
 	}
 	return nil
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// OffsetCommitRequest (ApiKey 8, v2)
+// ──────────────────────────────────────────────────────────────────────────────
+
+// OffsetCommitPartition holds the committed offset for one partition.
+type OffsetCommitPartition struct {
+	CommittedOffset   int64  // 8 bytes
+	CommittedMetadata string // human-readable metadata (may be empty)
+	Partition         int32  // 4 bytes
+}
+
+// OffsetCommitTopic groups partition commits under a topic.
+type OffsetCommitTopic struct {
+	TopicName  string
+	Partitions []OffsetCommitPartition
+}
+
+// OffsetCommitRequest (v2) wire layout after the request header:
+//
+//	GroupID              string
+//	GenerationID         int32
+//	MemberID             string
+//	RetentionTimeMs      int64
+//	topics[]
+//	  TopicName          string
+//	  partitions[]
+//	    Partition        int32
+//	    CommittedOffset  int64
+//	    CommittedMetadata string (nullable)
+type OffsetCommitRequest struct {
+	Topics          []OffsetCommitTopic
+	GroupID         string
+	MemberID        string
+	RetentionTimeMs int64
+	GenerationID    int32
+}
+
+// ParseOffsetCommitRequest reads an OffsetCommitRequest v2 body after the header.
+func (d *Decoder) ParseOffsetCommitRequest(header *RequestHeader) (*OffsetCommitRequest, error) {
+	groupID, err := d.ReadString()
+	if err != nil {
+		return nil, fmt.Errorf("offset commit: read group_id: %w", err)
+	}
+
+	generationID, err := d.ReadInt32()
+	if err != nil {
+		return nil, fmt.Errorf("offset commit: read generation_id: %w", err)
+	}
+
+	memberID, err := d.ReadString()
+	if err != nil {
+		return nil, fmt.Errorf("offset commit: read member_id: %w", err)
+	}
+
+	retentionTimeMs, err := d.ReadInt64()
+	if err != nil {
+		return nil, fmt.Errorf("offset commit: read retention_time_ms: %w", err)
+	}
+
+	topicCount, err := d.ReadInt32()
+	if err != nil {
+		return nil, fmt.Errorf("offset commit: read topic count: %w", err)
+	}
+
+	topics := make([]OffsetCommitTopic, 0, topicCount)
+	for i := int32(0); i < topicCount; i++ {
+		topicName, err := d.ReadString()
+		if err != nil {
+			return nil, fmt.Errorf("offset commit: topic[%d] name: %w", i, err)
+		}
+
+		partCount, err := d.ReadInt32()
+		if err != nil {
+			return nil, fmt.Errorf("offset commit: topic[%d] partition count: %w", i, err)
+		}
+
+		partitions := make([]OffsetCommitPartition, 0, partCount)
+		for j := int32(0); j < partCount; j++ {
+			partition, err := d.ReadInt32()
+			if err != nil {
+				return nil, fmt.Errorf("offset commit: topic[%d] partition[%d] index: %w", i, j, err)
+			}
+			committedOffset, err := d.ReadInt64()
+			if err != nil {
+				return nil, fmt.Errorf("offset commit: topic[%d] partition[%d] offset: %w", i, j, err)
+			}
+			committedMetadata, err := d.ReadString()
+			if err != nil {
+				return nil, fmt.Errorf("offset commit: topic[%d] partition[%d] metadata: %w", i, j, err)
+			}
+			partitions = append(partitions, OffsetCommitPartition{
+				Partition:         partition,
+				CommittedOffset:   committedOffset,
+				CommittedMetadata: committedMetadata,
+			})
+		}
+		topics = append(topics, OffsetCommitTopic{TopicName: topicName, Partitions: partitions})
+	}
+
+	return &OffsetCommitRequest{
+		GroupID:         groupID,
+		GenerationID:    generationID,
+		MemberID:        memberID,
+		RetentionTimeMs: retentionTimeMs,
+		Topics:          topics,
+	}, nil
+}
+
+// OffsetCommitPartitionResponse is the result for one committed partition.
+type OffsetCommitPartitionResponse struct {
+	Partition int32
+	ErrorCode int16
+}
+
+// OffsetCommitTopicResponse groups partition results under a topic.
+type OffsetCommitTopicResponse struct {
+	TopicName  string
+	Partitions []OffsetCommitPartitionResponse
+}
+
+// OffsetCommitResponse (v2) wire layout:
+//
+//	CorrelationID  int32
+//	topics[]
+//	  TopicName    string
+//	  partitions[]
+//	    Partition  int32
+//	    ErrorCode  int16
+type OffsetCommitResponse struct {
+	Topics []OffsetCommitTopicResponse
+}
+
+// EncodeOffsetCommitResponse serialises an OffsetCommitResponse into the Encoder.
+func (e *Encoder) EncodeOffsetCommitResponse(correlationID int32, resp *OffsetCommitResponse) {
+	e.WriteInt32(correlationID)
+	e.WriteInt32(int32(len(resp.Topics)))
+	for _, t := range resp.Topics {
+		e.WriteString(t.TopicName)
+		e.WriteInt32(int32(len(t.Partitions)))
+		for _, p := range t.Partitions {
+			e.WriteInt32(p.Partition)
+			e.WriteInt16(p.ErrorCode)
+		}
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// OffsetFetchRequest (ApiKey 9, v1)
+// ──────────────────────────────────────────────────────────────────────────────
+
+// OffsetFetchPartition identifies a single partition to fetch an offset for.
+type OffsetFetchPartition struct {
+	Partition int32
+}
+
+// OffsetFetchTopic groups partitions under a topic.
+type OffsetFetchTopic struct {
+	TopicName  string
+	Partitions []OffsetFetchPartition
+}
+
+// OffsetFetchRequest (v1) wire layout after the request header:
+//
+//	GroupID   string
+//	topics[]
+//	  TopicName  string
+//	  partitions[]
+//	    Partition int32
+type OffsetFetchRequest struct {
+	Topics  []OffsetFetchTopic
+	GroupID string
+}
+
+// ParseOffsetFetchRequest reads an OffsetFetchRequest v1 body after the header.
+func (d *Decoder) ParseOffsetFetchRequest(header *RequestHeader) (*OffsetFetchRequest, error) {
+	groupID, err := d.ReadString()
+	if err != nil {
+		return nil, fmt.Errorf("offset fetch: read group_id: %w", err)
+	}
+
+	topicCount, err := d.ReadInt32()
+	if err != nil {
+		return nil, fmt.Errorf("offset fetch: read topic count: %w", err)
+	}
+
+	topics := make([]OffsetFetchTopic, 0, topicCount)
+	for i := int32(0); i < topicCount; i++ {
+		topicName, err := d.ReadString()
+		if err != nil {
+			return nil, fmt.Errorf("offset fetch: topic[%d] name: %w", i, err)
+		}
+
+		partCount, err := d.ReadInt32()
+		if err != nil {
+			return nil, fmt.Errorf("offset fetch: topic[%d] partition count: %w", i, err)
+		}
+
+		partitions := make([]OffsetFetchPartition, 0, partCount)
+		for j := int32(0); j < partCount; j++ {
+			partition, err := d.ReadInt32()
+			if err != nil {
+				return nil, fmt.Errorf("offset fetch: topic[%d] partition[%d] index: %w", i, j, err)
+			}
+			partitions = append(partitions, OffsetFetchPartition{Partition: partition})
+		}
+		topics = append(topics, OffsetFetchTopic{TopicName: topicName, Partitions: partitions})
+	}
+
+	return &OffsetFetchRequest{GroupID: groupID, Topics: topics}, nil
+}
+
+// OffsetFetchPartitionResponse carries the committed offset for one partition.
+type OffsetFetchPartitionResponse struct {
+	CommittedOffset   int64  // OffsetUnknown (-1) when no commit exists
+	CommittedMetadata string // empty when unknown
+	Partition         int32
+	ErrorCode         int16
+}
+
+// OffsetFetchTopicResponse groups partition results under a topic.
+type OffsetFetchTopicResponse struct {
+	TopicName  string
+	Partitions []OffsetFetchPartitionResponse
+}
+
+// OffsetFetchResponse (v1) wire layout:
+//
+//	CorrelationID int32
+//	topics[]
+//	  TopicName   string
+//	  partitions[]
+//	    Partition          int32
+//	    CommittedOffset    int64
+//	    CommittedMetadata  string (nullable)
+//	    ErrorCode          int16
+type OffsetFetchResponse struct {
+	Topics []OffsetFetchTopicResponse
+}
+
+// EncodeOffsetFetchResponse serialises an OffsetFetchResponse into the Encoder.
+func (e *Encoder) EncodeOffsetFetchResponse(correlationID int32, resp *OffsetFetchResponse) {
+	e.WriteInt32(correlationID)
+	e.WriteInt32(int32(len(resp.Topics)))
+	for _, t := range resp.Topics {
+		e.WriteString(t.TopicName)
+		e.WriteInt32(int32(len(t.Partitions)))
+		for _, p := range t.Partitions {
+			e.WriteInt32(p.Partition)
+			e.WriteInt64(p.CommittedOffset)
+			e.WriteString(p.CommittedMetadata)
+			e.WriteInt16(p.ErrorCode)
+		}
+	}
 }
 
 // EncodeMetadataResponse encodes a MetadataResponse into the Encoder.

@@ -965,3 +965,230 @@ func TestHandler_FetchRequest_MultiplePartitionsIsolated(t *testing.T) {
 
 // Verify that errors.Is is still importable in this package (used by handler.go).
 var _ = errors.New
+
+// ── OffsetCommit / OffsetFetch helpers ────────────────────────────────────────
+
+// buildOffsetCommitFrame encodes an OffsetCommitRequest v2 on-wire frame.
+func buildOffsetCommitFrame(correlationID int32, clientID, groupID string, topic string, partition int32, offset int64) []byte {
+	var body bytes.Buffer
+	body.Write(buildRequestHeader(protocol.ApiKeyOffsetCommit, 2, correlationID, clientID))
+
+	// GroupID
+	binary.Write(&body, binary.BigEndian, int16(len(groupID)))
+	body.WriteString(groupID)
+	// GenerationID
+	binary.Write(&body, binary.BigEndian, int32(-1))
+	// MemberID (empty)
+	binary.Write(&body, binary.BigEndian, int16(0))
+	// RetentionTimeMs (-1 = use broker default)
+	binary.Write(&body, binary.BigEndian, int64(-1))
+	// topics array: 1 topic
+	binary.Write(&body, binary.BigEndian, int32(1))
+	binary.Write(&body, binary.BigEndian, int16(len(topic)))
+	body.WriteString(topic)
+	// partitions array: 1 partition
+	binary.Write(&body, binary.BigEndian, int32(1))
+	binary.Write(&body, binary.BigEndian, partition)
+	binary.Write(&body, binary.BigEndian, offset)
+	// CommittedMetadata: empty string
+	binary.Write(&body, binary.BigEndian, int16(0))
+
+	return buildFrame(body.Bytes())
+}
+
+// buildOffsetFetchFrame encodes an OffsetFetchRequest v1 on-wire frame.
+func buildOffsetFetchFrame(correlationID int32, clientID, groupID string, topic string, partition int32) []byte {
+	var body bytes.Buffer
+	body.Write(buildRequestHeader(protocol.ApiKeyOffsetFetch, 1, correlationID, clientID))
+
+	binary.Write(&body, binary.BigEndian, int16(len(groupID)))
+	body.WriteString(groupID)
+	// topics array: 1 topic
+	binary.Write(&body, binary.BigEndian, int32(1))
+	binary.Write(&body, binary.BigEndian, int16(len(topic)))
+	body.WriteString(topic)
+	// partitions array: 1 partition
+	binary.Write(&body, binary.BigEndian, int32(1))
+	binary.Write(&body, binary.BigEndian, partition)
+
+	return buildFrame(body.Bytes())
+}
+
+// decodeOffsetCommitResponse parses an OffsetCommitResponse body.
+func decodeOffsetCommitResponse(t *testing.T, body []byte) (corrID int32, errCode int16) {
+	t.Helper()
+	dec := protocol.NewDecoder(bytes.NewReader(body))
+	corrID, _ = dec.ReadInt32()
+	dec.ReadInt32()  // topic count
+	dec.ReadString() // topic name
+	dec.ReadInt32()  // partition count
+	dec.ReadInt32()  // partition index
+	errCode, _ = dec.ReadInt16()
+	return
+}
+
+// decodeOffsetFetchResponse parses an OffsetFetchResponse body and returns the
+// committed offset for the first partition of the first topic.
+func decodeOffsetFetchResponse(t *testing.T, body []byte) (corrID int32, committedOffset int64, errCode int16) {
+	t.Helper()
+	dec := protocol.NewDecoder(bytes.NewReader(body))
+	corrID, _ = dec.ReadInt32()
+	dec.ReadInt32()  // topic count
+	dec.ReadString() // topic name
+	dec.ReadInt32()  // partition count
+	dec.ReadInt32()  // partition index
+	committedOffset, _ = dec.ReadInt64()
+	dec.ReadString() // metadata
+	errCode, _ = dec.ReadInt16()
+	return
+}
+
+// ── OffsetCommit tests ────────────────────────────────────────────────────────
+
+// TestHandler_OffsetCommit_StoresOffset verifies that a committed offset is
+// persisted to __consumer_offsets and returned by a subsequent OffsetFetch.
+func TestHandler_OffsetCommit_StoresOffset(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	h, _ := newTestHandler(t)
+	go h.Handle(serverConn)
+
+	// Commit offset 42 for group "my-group", topic "events", partition 0.
+	clientConn.Write(buildOffsetCommitFrame(1, "c", "my-group", "events", 0, 42))
+	body := readResponse(t, clientConn)
+
+	_, errCode := decodeOffsetCommitResponse(t, body)
+	if errCode != 0 {
+		t.Fatalf("offset commit error code = %d, want 0", errCode)
+	}
+
+	// Fetch the committed offset back.
+	clientConn.Write(buildOffsetFetchFrame(2, "c", "my-group", "events", 0))
+	body = readResponse(t, clientConn)
+
+	_, offset, fetchErrCode := decodeOffsetFetchResponse(t, body)
+	if fetchErrCode != 0 {
+		t.Fatalf("offset fetch error code = %d, want 0", fetchErrCode)
+	}
+	if offset != 42 {
+		t.Errorf("committed offset = %d, want 42", offset)
+	}
+}
+
+// TestHandler_OffsetFetch_UnknownGroup returns OffsetUnknown (-1) for a group
+// that has never committed.
+func TestHandler_OffsetFetch_UnknownGroup(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	h, _ := newTestHandler(t)
+	go h.Handle(serverConn)
+
+	clientConn.Write(buildOffsetFetchFrame(3, "c", "ghost-group", "events", 0))
+	body := readResponse(t, clientConn)
+
+	_, offset, errCode := decodeOffsetFetchResponse(t, body)
+	if errCode != 0 {
+		t.Fatalf("error code = %d, want 0", errCode)
+	}
+	if offset != protocol.OffsetUnknown {
+		t.Errorf("offset = %d, want %d (OffsetUnknown)", offset, protocol.OffsetUnknown)
+	}
+}
+
+// TestHandler_OffsetCommit_OverwritesOffset verifies that committing a new
+// offset for the same group/topic/partition overwrites the previous one.
+func TestHandler_OffsetCommit_OverwritesOffset(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	h, _ := newTestHandler(t)
+	go h.Handle(serverConn)
+
+	clientConn.Write(buildOffsetCommitFrame(1, "c", "grp", "t", 0, 10))
+	readResponse(t, clientConn) // consume first commit response
+
+	clientConn.Write(buildOffsetCommitFrame(2, "c", "grp", "t", 0, 99))
+	readResponse(t, clientConn) // consume second commit response
+
+	clientConn.Write(buildOffsetFetchFrame(3, "c", "grp", "t", 0))
+	body := readResponse(t, clientConn)
+
+	_, offset, _ := decodeOffsetFetchResponse(t, body)
+	if offset != 99 {
+		t.Errorf("offset = %d, want 99 (latest commit)", offset)
+	}
+}
+
+// TestHandler_OffsetCommit_IsolatedByGroup verifies two consumer groups
+// committing to the same topic-partition maintain independent offsets.
+func TestHandler_OffsetCommit_IsolatedByGroup(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	h, _ := newTestHandler(t)
+	go h.Handle(serverConn)
+
+	clientConn.Write(buildOffsetCommitFrame(1, "c", "group-a", "t", 0, 111))
+	readResponse(t, clientConn)
+
+	clientConn.Write(buildOffsetCommitFrame(2, "c", "group-b", "t", 0, 222))
+	readResponse(t, clientConn)
+
+	clientConn.Write(buildOffsetFetchFrame(3, "c", "group-a", "t", 0))
+	bodyA := readResponse(t, clientConn)
+	_, offsetA, _ := decodeOffsetFetchResponse(t, bodyA)
+
+	clientConn.Write(buildOffsetFetchFrame(4, "c", "group-b", "t", 0))
+	bodyB := readResponse(t, clientConn)
+	_, offsetB, _ := decodeOffsetFetchResponse(t, bodyB)
+
+	if offsetA != 111 {
+		t.Errorf("group-a offset = %d, want 111", offsetA)
+	}
+	if offsetB != 222 {
+		t.Errorf("group-b offset = %d, want 222", offsetB)
+	}
+}
+
+// TestHandler_OffsetCommit_CorrelationID verifies the response echoes the request's correlationID.
+func TestHandler_OffsetCommit_CorrelationID(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	h, _ := newTestHandler(t)
+	go h.Handle(serverConn)
+
+	clientConn.Write(buildOffsetCommitFrame(777, "c", "grp", "t", 0, 1))
+	body := readResponse(t, clientConn)
+
+	corrID, _ := decodeOffsetCommitResponse(t, body)
+	if corrID != 777 {
+		t.Errorf("correlationID = %d, want 777", corrID)
+	}
+}
+
+// TestHandler_OffsetCommit_WritesToConsumerOffsetsTopic verifies that
+// __consumer_offsets exists in the BrokerStore after a commit.
+func TestHandler_OffsetCommit_WritesToConsumerOffsetsTopic(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	h, bs := newTestHandler(t)
+	go h.Handle(serverConn)
+
+	clientConn.Write(buildOffsetCommitFrame(1, "c", "grp", "events", 0, 5))
+	readResponse(t, clientConn)
+
+	found := false
+	for _, tp := range bs.Topics() {
+		if tp.Topic == protocol.ConsumerOffsetsTopic {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected %q topic to exist in BrokerStore after commit", protocol.ConsumerOffsetsTopic)
+	}
+}
