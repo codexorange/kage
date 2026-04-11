@@ -36,23 +36,23 @@ type MetadataRequest struct {
 
 // MetadataResponse (ApiKey 3)
 type PartitionMetadata struct {
-	ErrorCode int16
-	Partition int32
-	Leader    int32
-	Replicas  []int32
-	Isr       []int32
+	Replicas  []int32 // 24 bytes
+	Isr       []int32 // 24 bytes
+	Partition int32   // 4 bytes
+	Leader    int32   // 4 bytes
+	ErrorCode int16   // 2 bytes
 }
 
 type TopicMetadata struct {
-	ErrorCode  int16
-	Name       string
-	Partitions []PartitionMetadata
+	Partitions []PartitionMetadata // 24 bytes
+	Name       string              // 16 bytes
+	ErrorCode  int16               // 2 bytes
 }
 
 type Broker struct {
-	NodeID int32
-	Host   string
-	Port   int32
+	Host   string // 16 bytes
+	NodeID int32  // 4 bytes
+	Port   int32  // 4 bytes
 }
 
 type MetadataResponse struct {
@@ -122,8 +122,8 @@ func (d *Decoder) ParseMetadataRequest(header *RequestHeader) (*MetadataRequest,
 // ProducePartitionData holds the raw RecordBatch bytes for one partition.
 // We treat the batch as opaque bytes — Kage does not parse individual records.
 type ProducePartitionData struct {
-	Partition   int32
-	RecordBatch []byte // raw bytes of the Kafka RecordBatch
+	RecordBatch []byte // 24 bytes — raw bytes of the Kafka RecordBatch
+	Partition   int32  // 4 bytes
 }
 
 // ProduceTopicData groups partition batches under a single topic name.
@@ -144,11 +144,11 @@ type ProduceTopicData struct {
 //	    BatchSize    int32   (byte length of RecordBatch)
 //	    RecordBatch  []byte
 type ProduceRequest struct {
-	Header          *RequestHeader
-	TransactionalID string // empty when null
-	Acks            int16
-	TimeoutMs       int32
-	Topics          []ProduceTopicData
+	Topics          []ProduceTopicData // 24 bytes
+	TransactionalID string             // 16 bytes — empty when null
+	Header          *RequestHeader     // 8 bytes
+	TimeoutMs       int32              // 4 bytes
+	Acks            int16              // 2 bytes
 }
 
 // ParseProduceRequest reads the ProduceRequest body after the header.
@@ -237,9 +237,9 @@ func (d *Decoder) ParseProduceRequest(header *RequestHeader) (*ProduceRequest, e
 
 // ProducePartitionResponse carries the result for a single partition write.
 type ProducePartitionResponse struct {
-	Partition  int32
-	ErrorCode  int16
-	BaseOffset int64 // byte offset returned by storage.Segment.Append
+	BaseOffset int64  // 8 bytes — byte offset returned by storage.Segment.Append
+	Partition  int32  // 4 bytes
+	ErrorCode  int16  // 2 bytes
 }
 
 // ProduceTopicResponse groups partition results under a topic name.
@@ -283,9 +283,9 @@ func (e *Encoder) EncodeProduceResponse(correlationID int32, resp *ProduceRespon
 
 // FetchPartitionData holds the fetch parameters for one partition.
 type FetchPartitionData struct {
-	Partition          int32
-	FetchOffset        int64 // byte offset in the log to start reading from
-	PartitionMaxBytes  int32 // max bytes to return for this partition
+	FetchOffset       int64 // 8 bytes — byte offset in the log to start reading from
+	Partition         int32 // 4 bytes
+	PartitionMaxBytes int32 // 4 bytes — max bytes to return for this partition
 }
 
 // FetchTopicData groups partition fetch requests under a single topic name.
@@ -308,13 +308,13 @@ type FetchTopicData struct {
 //	    FetchOffset       int64
 //	    PartitionMaxBytes int32
 type FetchRequest struct {
-	Header         *RequestHeader
-	ReplicaID      int32
-	MaxWaitMs      int32
-	MinBytes       int32
-	MaxBytes       int32
-	IsolationLevel int8
-	Topics         []FetchTopicData
+	Topics         []FetchTopicData // 24 bytes
+	Header         *RequestHeader   // 8 bytes
+	ReplicaID      int32            // 4 bytes
+	MaxWaitMs      int32            // 4 bytes
+	MinBytes       int32            // 4 bytes
+	MaxBytes       int32            // 4 bytes
+	IsolationLevel int8             // 1 byte
 }
 
 // ParseFetchRequest reads a FetchRequest v4 body after the header.
@@ -407,10 +407,10 @@ const (
 
 // FetchPartitionResponse holds the result for one fetched partition.
 type FetchPartitionResponse struct {
-	Partition      int32
-	ErrorCode      int16
-	HighWatermark  int64  // byte size of the log (end of log position)
-	RecordBatch    []byte // raw record batch bytes; nil when ErrorCode != 0
+	RecordBatch   []byte // 24 bytes — raw record batch bytes; nil when ErrorCode != 0
+	HighWatermark int64  // 8 bytes — byte size of the log (end of log position)
+	Partition     int32  // 4 bytes
+	ErrorCode     int16  // 2 bytes
 }
 
 // FetchTopicResponse groups partition results under a topic name.
@@ -432,8 +432,8 @@ type FetchTopicResponse struct {
 //	    BatchSize      int32   (-1 when no records)
 //	    RecordBatch    []byte  (absent when BatchSize == -1)
 type FetchResponse struct {
-	ThrottleTimeMs int32
-	Topics         []FetchTopicResponse
+	Topics         []FetchTopicResponse // 24 bytes
+	ThrottleTimeMs int32                // 4 bytes
 }
 
 // EncodeFetchResponse serialises a FetchResponse into the Encoder.
