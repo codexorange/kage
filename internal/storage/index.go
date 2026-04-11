@@ -183,10 +183,14 @@ func (idx *Index) Len() int {
 	return len(idx.entries)
 }
 
-// Flush commits buffered index writes to the underlying OS file.
+// Flush commits buffered index writes to the OS and then calls fsync to
+// guarantee physical durability.
 func (idx *Index) Flush() error {
 	if err := idx.bw.Flush(); err != nil {
 		return fmt.Errorf("storage: flush index: %w", err)
+	}
+	if err := idx.file.Sync(); err != nil {
+		return fmt.Errorf("storage: fsync index: %w", err)
 	}
 	return nil
 }

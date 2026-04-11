@@ -144,14 +144,17 @@ func (s *Segment) Append(payload []byte) (offset uint64, err error) {
 	return offset, nil
 }
 
-// Flush commits all buffered writes — both log and index — to the underlying
-// OS files.  It does NOT call fsync; durability is the caller's responsibility.
+// Flush commits all buffered writes to the OS and then calls fsync on both
+// the log file and the index file to guarantee physical durability.
 func (s *Segment) Flush() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if err := s.bw.Flush(); err != nil {
 		return fmt.Errorf("storage: flush segment: %w", err)
+	}
+	if err := s.file.Sync(); err != nil {
+		return fmt.Errorf("storage: fsync segment: %w", err)
 	}
 	if err := s.idx.Flush(); err != nil {
 		return err
