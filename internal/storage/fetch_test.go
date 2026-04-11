@@ -18,9 +18,12 @@ func TestPartitionStore_Read_ReturnsData(t *testing.T) {
 
 	// The stored record is: 4-byte header + payload.
 	recordSize := int32(recordHeaderSize + len(payload))
-	r, err := ps.Read(off, recordSize)
+	r, n, err := ps.Read(off, recordSize)
 	if err != nil {
 		t.Fatalf("Read: %v", err)
+	}
+	if n != recordSize {
+		t.Errorf("n = %d, want %d", n, recordSize)
 	}
 
 	got, err := io.ReadAll(r)
@@ -41,9 +44,12 @@ func TestPartitionStore_Read_MaxBytesCap(t *testing.T) {
 		t.Fatalf("Append: %v", err)
 	}
 
-	r, err := ps.Read(0, 4) // ask for only 4 bytes
+	r, n, err := ps.Read(0, 4) // ask for only 4 bytes
 	if err != nil {
 		t.Fatalf("Read: %v", err)
+	}
+	if n != 4 {
+		t.Errorf("n = %d, want 4", n)
 	}
 	got, _ := io.ReadAll(r)
 	if len(got) != 4 {
@@ -56,7 +62,7 @@ func TestPartitionStore_Read_MaxBytesCap(t *testing.T) {
 func TestPartitionStore_Read_ErrInvalidOffset(t *testing.T) {
 	ps := openTestStore(t)
 
-	_, err := ps.Read(9999, 128)
+	_, _, err := ps.Read(9999, 128)
 	if !errors.Is(err, ErrInvalidOffset) {
 		t.Errorf("want ErrInvalidOffset, got %v", err)
 	}
@@ -72,14 +78,16 @@ func TestPartitionStore_Read_AvailableCap(t *testing.T) {
 		t.Fatalf("Append: %v", err)
 	}
 
-	// Ask for far more than what was written.
-	r, err := ps.Read(0, 1<<20)
+	want := int32(recordHeaderSize + len(payload))
+	r, n, err := ps.Read(0, 1<<20)
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
+	if n != want {
+		t.Errorf("n = %d, want %d", n, want)
+	}
 	got, _ := io.ReadAll(r)
-	want := int(recordHeaderSize + len(payload))
-	if len(got) != want {
+	if len(got) != int(want) {
 		t.Errorf("got %d bytes, want %d", len(got), want)
 	}
 }

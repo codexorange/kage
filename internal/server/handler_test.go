@@ -37,15 +37,15 @@ func (m *mockStore) Append(data []byte) (uint64, error) {
 	return off, nil
 }
 
-func (m *mockStore) Read(fetchOffset uint64, maxBytes int32) (io.Reader, error) {
+func (m *mockStore) Read(fetchOffset uint64, maxBytes int32) (io.Reader, int32, error) {
 	if m.fetchErr != nil {
-		return nil, m.fetchErr
+		return nil, 0, m.fetchErr
 	}
 	data := m.fetchData
 	if int32(len(data)) > maxBytes {
 		data = data[:maxBytes]
 	}
-	return bytes.NewReader(data), nil
+	return bytes.NewReader(data), int32(len(data)), nil
 }
 
 func (m *mockStore) Size() int64 {

@@ -1,6 +1,9 @@
 package protocol
 
-import "fmt"
+import (
+	"fmt"
+	"io"
+)
 
 // API keys
 const (
@@ -407,10 +410,11 @@ const (
 
 // FetchPartitionResponse holds the result for one fetched partition.
 type FetchPartitionResponse struct {
-	RecordBatch   []byte // 24 bytes — raw record batch bytes; nil when ErrorCode != 0
-	HighWatermark int64  // 8 bytes — byte size of the log (end of log position)
-	Partition     int32  // 4 bytes
-	ErrorCode     int16  // 2 bytes
+	RecordBatch   io.Reader // reader over the raw record batch; nil when ErrorCode != 0
+	HighWatermark int64     // 8 bytes — byte size of the log (end of log position)
+	BatchSize     int32     // 4 bytes — byte length of RecordBatch; -1 when nil
+	Partition     int32     // 4 bytes
+	ErrorCode     int16     // 2 bytes
 }
 
 // FetchTopicResponse groups partition results under a topic name.
@@ -436,27 +440,76 @@ type FetchResponse struct {
 	ThrottleTimeMs int32                // 4 bytes
 }
 
-// EncodeFetchResponse serialises a FetchResponse into the Encoder.
-func (e *Encoder) EncodeFetchResponse(correlationID int32, resp *FetchResponse) {
-	e.WriteInt32(correlationID)
-	e.WriteInt32(resp.ThrottleTimeMs)
-
-	e.WriteInt32(int32(len(resp.Topics)))
+// WriteFetchResponse writes a complete length-prefixed FetchResponse frame to w.
+//
+// Strategy: pre-compute the total payload length (all sizes are known via
+// BatchSize fields) so the 4-byte Kafka size prefix can be written first.
+// Then, for each partition, write the fixed-size metadata fields and immediately
+// stream the RecordBatch via io.Copy — so the wire order matches the Kafka
+// protocol: [partition meta][batch bytes] interleaved per partition.
+func WriteFetchResponse(w io.Writer, correlationID int32, resp *FetchResponse) error {
+	// Pre-compute total payload size.
+	// Per-partition fixed fields: partition(4) + errCode(2) + hwm(8) + batchSize(4) = 18 bytes.
+	const partitionFixedBytes = 18
+	// Frame header: corrID(4) + throttle(4) + topicCount(4) = 12 bytes.
+	totalPayload := int32(12)
 	for _, t := range resp.Topics {
-		e.WriteString(t.TopicName)
-		e.WriteInt32(int32(len(t.Partitions)))
+		// topic: nameLen(2) + name + partCount(4).
+		totalPayload += int32(2 + len(t.TopicName) + 4)
 		for _, p := range t.Partitions {
-			e.WriteInt32(p.Partition)
-			e.WriteInt16(p.ErrorCode)
-			e.WriteInt64(p.HighWatermark)
-			if p.RecordBatch == nil {
-				e.WriteInt32(-1) // null records
-			} else {
-				e.WriteInt32(int32(len(p.RecordBatch)))
-				e.WriteBytes(p.RecordBatch)
+			totalPayload += partitionFixedBytes
+			if p.BatchSize > 0 {
+				totalPayload += p.BatchSize
 			}
 		}
 	}
+
+	// Write 4-byte Kafka size prefix.
+	var sizeBuf [4]byte
+	sizeBuf[0] = byte(totalPayload >> 24)
+	sizeBuf[1] = byte(totalPayload >> 16)
+	sizeBuf[2] = byte(totalPayload >> 8)
+	sizeBuf[3] = byte(totalPayload)
+	if _, err := w.Write(sizeBuf[:]); err != nil {
+		return err
+	}
+
+	// Write frame header.
+	hdr := NewEncoder()
+	hdr.WriteInt32(correlationID)
+	hdr.WriteInt32(resp.ThrottleTimeMs)
+	hdr.WriteInt32(int32(len(resp.Topics)))
+	if _, err := w.Write(hdr.buffer.Bytes()); err != nil {
+		return err
+	}
+
+	// Write each topic and its partitions, interleaving batch data immediately
+	// after each partition's fixed metadata fields.
+	for _, t := range resp.Topics {
+		topicEnc := NewEncoder()
+		topicEnc.WriteString(t.TopicName)
+		topicEnc.WriteInt32(int32(len(t.Partitions)))
+		if _, err := w.Write(topicEnc.buffer.Bytes()); err != nil {
+			return err
+		}
+
+		for _, p := range t.Partitions {
+			partEnc := NewEncoder()
+			partEnc.WriteInt32(p.Partition)
+			partEnc.WriteInt16(p.ErrorCode)
+			partEnc.WriteInt64(p.HighWatermark)
+			partEnc.WriteInt32(p.BatchSize)
+			if _, err := w.Write(partEnc.buffer.Bytes()); err != nil {
+				return err
+			}
+			if p.RecordBatch != nil && p.BatchSize > 0 {
+				if _, err := io.Copy(w, p.RecordBatch); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // EncodeMetadataResponse encodes a MetadataResponse into the Encoder.

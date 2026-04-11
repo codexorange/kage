@@ -17,10 +17,12 @@ type AppendStore interface {
 // FetchStore is the interface the server layer uses to read record batches.
 // It is satisfied by *PartitionStore and can be faked in tests.
 type FetchStore interface {
-	// Read returns an io.Reader covering [fetchOffset, fetchOffset+maxBytes)
-	// in the log.  The caller is responsible for capping maxBytes before calling.
+	// Read returns an io.Reader covering [fetchOffset, fetchOffset+n) where n
+	// is the actual byte count (≤ maxBytes, capped to available data).
+	// n is returned alongside the reader so callers can write the batch-size
+	// field without buffering the payload.
 	// Returns ErrInvalidOffset when fetchOffset is beyond the written data.
-	Read(fetchOffset uint64, maxBytes int32) (io.Reader, error)
+	Read(fetchOffset uint64, maxBytes int32) (io.Reader, int32, error)
 
 	// Size returns the total bytes written across all segments (high-watermark).
 	Size() int64
@@ -101,13 +103,13 @@ func (ps *PartitionStore) rollover() error {
 //
 // fetchOffset is the byte offset returned by a prior Append call.
 // maxBytes caps how many bytes are served; it must be > 0.
-func (ps *PartitionStore) Read(fetchOffset uint64, maxBytes int32) (io.Reader, error) {
+func (ps *PartitionStore) Read(fetchOffset uint64, maxBytes int32) (io.Reader, int32, error) {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 
 	segSize := ps.active.Size() // total bytes written (includes buffered data)
 	if int64(fetchOffset) >= segSize {
-		return nil, ErrInvalidOffset
+		return nil, 0, ErrInvalidOffset
 	}
 
 	// Cap the read window: don't read past the end of written data.
@@ -116,7 +118,11 @@ func (ps *PartitionStore) Read(fetchOffset uint64, maxBytes int32) (io.Reader, e
 		maxBytes = int32(available)
 	}
 
-	return ps.active.Read(fetchOffset, maxBytes)
+	r, err := ps.active.Read(fetchOffset, maxBytes)
+	if err != nil {
+		return nil, 0, err
+	}
+	return r, maxBytes, nil
 }
 
 // Size returns the total bytes written to the active segment (high-watermark).

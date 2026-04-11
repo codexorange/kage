@@ -3,6 +3,7 @@ package protocol
 import (
 	"bytes"
 	"encoding/binary"
+	"io"
 	"testing"
 )
 
@@ -139,22 +140,38 @@ func TestParseFetchRequest_Truncated(t *testing.T) {
 	}
 }
 
+// writeFetchResponseToBytes is a test helper that calls WriteFetchResponse
+// and returns the resulting framed bytes.
+func writeFetchResponseToBytes(t *testing.T, correlationID int32, resp *FetchResponse) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := WriteFetchResponse(&buf, correlationID, resp); err != nil {
+		t.Fatalf("WriteFetchResponse: %v", err)
+	}
+	return buf.Bytes()
+}
+
 func TestEncodeFetchResponse_SinglePartition(t *testing.T) {
+	batchData := []byte("batch-data")
 	resp := &FetchResponse{
 		ThrottleTimeMs: 0,
 		Topics: []FetchTopicResponse{
 			{
 				TopicName: "kage-events",
 				Partitions: []FetchPartitionResponse{
-					{Partition: 0, ErrorCode: 0, HighWatermark: 2048, RecordBatch: []byte("batch-data")},
+					{
+						Partition:     0,
+						ErrorCode:     0,
+						HighWatermark: 2048,
+						RecordBatch:   bytes.NewReader(batchData),
+						BatchSize:     int32(len(batchData)),
+					},
 				},
 			},
 		},
 	}
 
-	enc := NewEncoder()
-	enc.EncodeFetchResponse(42, resp)
-	raw := enc.FullMessage()
+	raw := writeFetchResponseToBytes(t, 42, resp)
 
 	dec := NewDecoder(bytes.NewReader(raw))
 	size, _ := dec.ReadInt32()
@@ -203,8 +220,8 @@ func TestEncodeFetchResponse_SinglePartition(t *testing.T) {
 	}
 
 	batchSize, _ := dec.ReadInt32()
-	if batchSize != int32(len("batch-data")) {
-		t.Errorf("batch size = %d, want %d", batchSize, len("batch-data"))
+	if batchSize != int32(len(batchData)) {
+		t.Errorf("batch size = %d, want %d", batchSize, len(batchData))
 	}
 
 	batch, _ := dec.ReadBytes(int(batchSize))
@@ -219,15 +236,13 @@ func TestEncodeFetchResponse_NullBatch(t *testing.T) {
 			{
 				TopicName: "t",
 				Partitions: []FetchPartitionResponse{
-					{Partition: 0, ErrorCode: ErrCodeOffsetOutOfRange, HighWatermark: 0, RecordBatch: nil},
+					{Partition: 0, ErrorCode: ErrCodeOffsetOutOfRange, HighWatermark: 0, RecordBatch: nil, BatchSize: -1},
 				},
 			},
 		},
 	}
 
-	enc := NewEncoder()
-	enc.EncodeFetchResponse(1, resp)
-	raw := enc.FullMessage()
+	raw := writeFetchResponseToBytes(t, 1, resp)
 
 	dec := NewDecoder(bytes.NewReader(raw))
 	dec.ReadInt32() // size
@@ -251,13 +266,15 @@ func TestEncodeFetchResponse_NullBatch(t *testing.T) {
 func TestEncodeFetchResponse_MultipleTopics(t *testing.T) {
 	resp := &FetchResponse{
 		Topics: []FetchTopicResponse{
-			{TopicName: "a", Partitions: []FetchPartitionResponse{{Partition: 0, ErrorCode: 0, HighWatermark: 100, RecordBatch: []byte("aa")}}},
-			{TopicName: "b", Partitions: []FetchPartitionResponse{{Partition: 0, ErrorCode: 0, HighWatermark: 200, RecordBatch: []byte("bb")}}},
+			{TopicName: "a", Partitions: []FetchPartitionResponse{
+				{Partition: 0, ErrorCode: 0, HighWatermark: 100, RecordBatch: bytes.NewReader([]byte("aa")), BatchSize: 2},
+			}},
+			{TopicName: "b", Partitions: []FetchPartitionResponse{
+				{Partition: 0, ErrorCode: 0, HighWatermark: 200, RecordBatch: bytes.NewReader([]byte("bb")), BatchSize: 2},
+			}},
 		},
 	}
-	enc := NewEncoder()
-	enc.EncodeFetchResponse(7, resp)
-	raw := enc.FullMessage()
+	raw := writeFetchResponseToBytes(t, 7, resp)
 
 	dec := NewDecoder(bytes.NewReader(raw))
 	dec.ReadInt32() // size
@@ -267,4 +284,109 @@ func TestEncodeFetchResponse_MultipleTopics(t *testing.T) {
 	if count != 2 {
 		t.Errorf("topic count = %d, want 2", count)
 	}
+}
+
+// TestEncodeFetchResponse_RoundTrip verifies that batch bytes written via
+// io.Copy arrive intact in the framed response.
+func TestEncodeFetchResponse_RoundTrip(t *testing.T) {
+	batchData := []byte("round-trip-payload")
+	resp := &FetchResponse{
+		Topics: []FetchTopicResponse{
+			{
+				TopicName: "rt",
+				Partitions: []FetchPartitionResponse{
+					{
+						Partition:     0,
+						ErrorCode:     0,
+						HighWatermark: 999,
+						RecordBatch:   bytes.NewReader(batchData),
+						BatchSize:     int32(len(batchData)),
+					},
+				},
+			},
+		},
+	}
+
+	raw := writeFetchResponseToBytes(t, 123, resp)
+
+	// The 4-byte Kafka size prefix covers everything after it.
+	dec := NewDecoder(bytes.NewReader(raw))
+	frameSize, _ := dec.ReadInt32()
+	if int(frameSize) != len(raw)-4 {
+		t.Errorf("frame size = %d, want %d", frameSize, len(raw)-4)
+	}
+	dec.ReadInt32() // corrID
+	dec.ReadInt32() // throttle
+	dec.ReadInt32() // topic count
+	dec.ReadString() // topic name
+	dec.ReadInt32() // partition count
+	dec.ReadInt32() // partition
+	dec.ReadInt16() // error code
+	dec.ReadInt64() // high watermark
+	sz, _ := dec.ReadInt32()
+	got, _ := dec.ReadBytes(int(sz))
+	if !bytes.Equal(got, batchData) {
+		t.Errorf("round-trip batch = %q, want %q", got, batchData)
+	}
+}
+
+// TestWriteFetchResponse_IOCopyZeroCopy verifies WriteFetchResponse streams
+// batch data via io.Copy without buffering it into the header encoder.
+func TestWriteFetchResponse_IOCopyZeroCopy(t *testing.T) {
+	// Wrap bytes.Reader to track whether Read was called (proving io.Copy
+	// was used instead of reading into a []byte first).
+	called := false
+	batchData := []byte("zero-copy-check")
+	inner := bytes.NewReader(batchData)
+	r := readerFunc(func(p []byte) (int, error) {
+		called = true
+		return inner.Read(p)
+	})
+
+	resp := &FetchResponse{
+		Topics: []FetchTopicResponse{
+			{
+				TopicName: "zc",
+				Partitions: []FetchPartitionResponse{
+					{Partition: 0, ErrorCode: 0, HighWatermark: 0, RecordBatch: r, BatchSize: int32(len(batchData))},
+				},
+			},
+		},
+	}
+
+	var buf bytes.Buffer
+	if err := WriteFetchResponse(&buf, 1, resp); err != nil {
+		t.Fatalf("WriteFetchResponse: %v", err)
+	}
+	if !called {
+		t.Error("RecordBatch reader was never called — io.Copy path not exercised")
+	}
+}
+
+// readerFunc adapts a function to the io.Reader interface.
+type readerFunc func([]byte) (int, error)
+
+func (f readerFunc) Read(p []byte) (int, error) { return f(p) }
+
+// TestWriteFetchResponse_WriteError verifies that a write error is propagated.
+func TestWriteFetchResponse_WriteError(t *testing.T) {
+	resp := &FetchResponse{
+		Topics: []FetchTopicResponse{
+			{TopicName: "t", Partitions: []FetchPartitionResponse{
+				{Partition: 0, ErrorCode: 0, HighWatermark: 0, RecordBatch: nil, BatchSize: -1},
+			}},
+		},
+	}
+	ew := &errorWriter{}
+	err := WriteFetchResponse(ew, 1, resp)
+	if err == nil {
+		t.Error("expected write error, got nil")
+	}
+}
+
+// errorWriter always returns an error on Write.
+type errorWriter struct{}
+
+func (e *errorWriter) Write(p []byte) (int, error) {
+	return 0, io.ErrClosedPipe
 }

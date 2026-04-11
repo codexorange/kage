@@ -185,7 +185,7 @@ func (h *Handler) handleFetch(conn net.Conn, dec *protocol.Decoder, header *prot
 				continue
 			}
 
-			r, err := h.store.Read(uint64(part.FetchOffset), cap)
+			r, n, err := h.store.Read(uint64(part.FetchOffset), cap)
 			if err != nil {
 				if errors.Is(err, storage.ErrInvalidOffset) {
 					h.logger.Warn("fetch: offset out of range",
@@ -206,21 +206,17 @@ func (h *Handler) handleFetch(conn net.Conn, dec *protocol.Decoder, header *prot
 				continue
 			}
 
-			batch, err := io.ReadAll(r)
-			if err != nil {
-				return fmt.Errorf("handleFetch: read batch: %w", err)
-			}
-
 			partResp.ErrorCode = protocol.ErrCodeNone
-			partResp.RecordBatch = batch
-			remaining -= int32(len(batch))
+			partResp.RecordBatch = r
+			partResp.BatchSize = n
+			remaining -= n
 
 			h.metrics.MessagesFetchedTotal.WithLabelValues(topic.TopicName).Inc()
 			h.logger.Info("fetch: batch served",
 				"topic", topic.TopicName,
 				"partition", part.Partition,
 				"fetch_offset", part.FetchOffset,
-				"batch_bytes", len(batch),
+				"batch_bytes", n,
 			)
 
 			topicResp.Partitions = append(topicResp.Partitions, partResp)
@@ -228,9 +224,7 @@ func (h *Handler) handleFetch(conn net.Conn, dec *protocol.Decoder, header *prot
 		resp.Topics = append(resp.Topics, topicResp)
 	}
 
-	enc := protocol.NewEncoder()
-	enc.EncodeFetchResponse(header.CorrelationID, resp)
-	if _, err := conn.Write(enc.FullMessage()); err != nil {
+	if err := protocol.WriteFetchResponse(conn, header.CorrelationID, resp); err != nil {
 		return fmt.Errorf("handleFetch: write response: %w", err)
 	}
 	return nil
