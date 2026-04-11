@@ -23,6 +23,10 @@ func (e *Encoder) WriteInt16(value int16) {
 	binary.Write(e.buffer, binary.BigEndian, value)
 }
 
+func (e *Encoder) WriteInt64(value int64) {
+	binary.Write(e.buffer, binary.BigEndian, value)
+}
+
 func (e *Encoder) WriteString(value string) {
 	e.WriteInt16(int16(len(value)))
 	e.buffer.WriteString(value)

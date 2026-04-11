@@ -26,6 +26,12 @@ func (d *Decoder) ReadInt32() (int32, error) {
 	return value, err
 }
 
+func (d *Decoder) ReadInt64() (int64, error) {
+	var value int64
+	err := binary.Read(d.reader, binary.BigEndian, &value)
+	return value, err
+}
+
 // In production it is better to pass a buffer pre-assigned to avoid allocations.
 func (d *Decoder) ReadBytes(n int) ([]byte, error) {
 	if n <= 0 {

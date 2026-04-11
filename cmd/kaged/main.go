@@ -12,10 +12,12 @@ import (
 	"time"
 
 	"github.com/codexorange/kage/internal/server"
+	"github.com/codexorange/kage/internal/storage"
 )
 
 const (
 	defaultAddr        = "0.0.0.0:9092"
+	defaultDataDir     = "/data"
 	maxConcurrentConns = 10_000
 	shutdownTimeout    = 10 * time.Second
 )
@@ -24,22 +26,39 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(logger)
 
-	addr := defaultAddr
-
 	// Root context cancelled on SIGTERM/SIGINT.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	lc := net.ListenConfig{}
-	listener, err := lc.Listen(ctx, "tcp", addr)
-	if err != nil {
-		logger.Error("failed to bind listener", "error", err, "addr", addr)
+	// Ensure the data directory exists.
+	if err := os.MkdirAll(defaultDataDir, 0o755); err != nil {
+		logger.Error("failed to create data dir", "path", defaultDataDir, "error", err)
 		os.Exit(1)
 	}
 
-	logger.Info("Kage broker started", "address", addr, "pid", os.Getpid(), "max_conns", maxConcurrentConns)
+	// Open the single partition store backed by the data directory.
+	store, err := storage.OpenPartitionStore(defaultDataDir, storage.SegmentConfig{})
+	if err != nil {
+		logger.Error("failed to open partition store", "dir", defaultDataDir, "error", err)
+		os.Exit(1)
+	}
+	defer store.Close()
 
-	handler := server.NewHandler(logger)
+	lc := net.ListenConfig{}
+	listener, err := lc.Listen(ctx, "tcp", defaultAddr)
+	if err != nil {
+		logger.Error("failed to bind listener", "error", err, "addr", defaultAddr)
+		os.Exit(1)
+	}
+
+	logger.Info("Kage broker started",
+		"address", defaultAddr,
+		"data_dir", defaultDataDir,
+		"pid", os.Getpid(),
+		"max_conns", maxConcurrentConns,
+	)
+
+	handler := server.NewHandler(logger, store)
 
 	// Semaphore: limits concurrent active connections.
 	sem := make(chan struct{}, maxConcurrentConns)
@@ -52,7 +71,6 @@ func main() {
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
-				// Listener was closed — normal shutdown path.
 				if errors.Is(err, net.ErrClosed) {
 					return
 				}
@@ -60,8 +78,6 @@ func main() {
 				return
 			}
 
-			// Acquire a slot in the worker pool. If the pool is full, the new
-			// connection is rejected immediately to apply back-pressure.
 			select {
 			case sem <- struct{}{}:
 			default:
@@ -76,7 +92,7 @@ func main() {
 			wg.Add(1)
 			go func(c net.Conn) {
 				defer func() {
-					<-sem // release slot back to pool
+					<-sem
 					wg.Done()
 				}()
 				handler.Handle(c)
@@ -84,14 +100,11 @@ func main() {
 		}
 	}()
 
-	// Block until signal is received.
 	<-ctx.Done()
 	logger.Info("shutdown signal received, closing listener")
 
-	// Stop accepting new connections.
 	listener.Close()
 
-	// Wait for active workers with a hard deadline.
 	shutdownDone := make(chan struct{})
 	go func() {
 		wg.Wait()
