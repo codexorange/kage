@@ -49,11 +49,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	store, err := storage.OpenPartitionStore(ctx, cfg.LogDirectory, storage.SegmentConfig{
+	store, err := storage.OpenBrokerStore(ctx, cfg.LogDirectory, storage.SegmentConfig{
 		MaxSize: cfg.MaxSegmentSize,
 	}, logger)
 	if err != nil {
-		logger.Error("failed to open partition store", "dir", cfg.LogDirectory, "error", err)
+		logger.Error("failed to open broker store", "dir", cfg.LogDirectory, "error", err)
 		os.Exit(1)
 	}
 	defer store.Close()

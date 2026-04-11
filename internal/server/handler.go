@@ -16,11 +16,11 @@ import (
 // Handler routes incoming Kafka requests to the appropriate response builder.
 type Handler struct {
 	logger  *slog.Logger
-	store   storage.Store
+	store   *storage.BrokerStore
 	metrics *metrics.Metrics
 }
 
-func NewHandler(logger *slog.Logger, store storage.Store, m *metrics.Metrics) *Handler {
+func NewHandler(logger *slog.Logger, store *storage.BrokerStore, m *metrics.Metrics) *Handler {
 	return &Handler{logger: logger, store: store, metrics: m}
 }
 
@@ -101,8 +101,21 @@ func (h *Handler) handleProduce(conn net.Conn, dec *protocol.Decoder, header *pr
 				Partition: part.Partition,
 			}
 
+			ps, err := h.store.GetOrCreatePartition(topic.TopicName, part.Partition)
+			if err != nil {
+				h.logger.Error("produce: failed to get partition store",
+					"topic", topic.TopicName,
+					"partition", part.Partition,
+					"error", err,
+				)
+				partResp.ErrorCode = 1
+				partResp.BaseOffset = -1
+				topicResp.Partitions = append(topicResp.Partitions, partResp)
+				continue
+			}
+
 			start := time.Now()
-			offset, err := h.store.Append(part.RecordBatch)
+			offset, err := ps.Append(part.RecordBatch)
 			h.metrics.ObserveDiskWrite(topic.TopicName, start)
 
 			if err != nil {
@@ -156,7 +169,6 @@ func (h *Handler) handleFetch(conn net.Conn, dec *protocol.Decoder, header *prot
 	}
 
 	remaining := req.MaxBytes
-	hwm := h.store.Size()
 
 	resp := &protocol.FetchResponse{
 		Topics: make([]protocol.FetchTopicResponse, 0, len(req.Topics)),
@@ -170,9 +182,23 @@ func (h *Handler) handleFetch(conn net.Conn, dec *protocol.Decoder, header *prot
 
 		for _, part := range topic.Partitions {
 			partResp := protocol.FetchPartitionResponse{
-				Partition:     part.Partition,
-				HighWatermark: hwm,
+				Partition: part.Partition,
+				BatchSize: -1,
 			}
+
+			ps, err := h.store.GetOrCreatePartition(topic.TopicName, part.Partition)
+			if err != nil {
+				h.logger.Error("fetch: failed to get partition store",
+					"topic", topic.TopicName,
+					"partition", part.Partition,
+					"error", err,
+				)
+				partResp.ErrorCode = protocol.ErrCodeOffsetOutOfRange
+				topicResp.Partitions = append(topicResp.Partitions, partResp)
+				continue
+			}
+
+			partResp.HighWatermark = ps.Size()
 
 			cap := part.PartitionMaxBytes
 			if remaining < cap {
@@ -185,7 +211,7 @@ func (h *Handler) handleFetch(conn net.Conn, dec *protocol.Decoder, header *prot
 				continue
 			}
 
-			r, n, err := h.store.Read(uint64(part.FetchOffset), cap)
+			r, n, err := ps.Read(uint64(part.FetchOffset), cap)
 			if err != nil {
 				if errors.Is(err, storage.ErrInvalidOffset) {
 					h.logger.Warn("fetch: offset out of range",
@@ -230,33 +256,54 @@ func (h *Handler) handleFetch(conn net.Conn, dec *protocol.Decoder, header *prot
 	return nil
 }
 
-// handleMetadata parses a MetadataRequest and responds with a hardcoded
-// single-topic, single-partition MetadataResponse.
+// handleMetadata parses a MetadataRequest and builds a MetadataResponse from
+// the live topic-partition map. If the client requests specific topics that do
+// not yet exist, they are created on demand. An empty topics list means "all".
 func (h *Handler) handleMetadata(conn net.Conn, dec *protocol.Decoder, header *protocol.RequestHeader) error {
-	_, err := dec.ParseMetadataRequest(header)
+	req, err := dec.ParseMetadataRequest(header)
 	if err != nil {
 		return fmt.Errorf("handleMetadata: %w", err)
+	}
+
+	// If client requested specific topics, ensure they exist.
+	for _, t := range req.Topics {
+		if _, err := h.store.GetOrCreatePartition(t, 0); err != nil {
+			h.logger.Warn("handleMetadata: could not create topic",
+				"topic", t, "error", err)
+		}
+	}
+
+	// Collect all known topic-partitions, grouped by topic.
+	tps := h.store.Topics()
+	byTopic := make(map[string][]int32, len(tps))
+	for _, tp := range tps {
+		byTopic[tp.Topic] = append(byTopic[tp.Topic], tp.Partition)
+	}
+
+	topicMeta := make([]protocol.TopicMetadata, 0, len(byTopic))
+	for topicName, partitions := range byTopic {
+		partMeta := make([]protocol.PartitionMetadata, 0, len(partitions))
+		for _, pid := range partitions {
+			partMeta = append(partMeta, protocol.PartitionMetadata{
+				ErrorCode: 0,
+				Partition: pid,
+				Leader:    1,
+				Replicas:  []int32{1},
+				Isr:       []int32{1},
+			})
+		}
+		topicMeta = append(topicMeta, protocol.TopicMetadata{
+			ErrorCode:  0,
+			Name:       topicName,
+			Partitions: partMeta,
+		})
 	}
 
 	resp := &protocol.MetadataResponse{
 		Brokers: []protocol.Broker{
 			{NodeID: 1, Host: "localhost", Port: 9092},
 		},
-		Topics: []protocol.TopicMetadata{
-			{
-				ErrorCode: 0,
-				Name:      "kage-events",
-				Partitions: []protocol.PartitionMetadata{
-					{
-						ErrorCode: 0,
-						Partition: 0,
-						Leader:    1,
-						Replicas:  []int32{1},
-						Isr:       []int32{1},
-					},
-				},
-			},
-		},
+		Topics: topicMeta,
 	}
 
 	enc := protocol.NewEncoder()

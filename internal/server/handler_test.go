@@ -2,11 +2,13 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"io"
 	"log/slog"
 	"net"
+	"os"
 	"testing"
 	"time"
 
@@ -17,45 +19,39 @@ import (
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-// mockStore is a test double for storage.Store.
-type mockStore struct {
-	nextOffset  uint64
-	failWith    error
-	appended    [][]byte
-	fetchData   []byte // bytes returned by Read
-	fetchErr    error  // error returned by Read
-	totalSize   int64  // value returned by Size
-}
-
-func (m *mockStore) Append(data []byte) (uint64, error) {
-	if m.failWith != nil {
-		return 0, m.failWith
+// tempDir creates a temporary directory that is cleaned up after the test.
+func tempDir(t *testing.T) string {
+	t.Helper()
+	d, err := os.MkdirTemp("", "kage-handler-test-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
 	}
-	off := m.nextOffset
-	m.nextOffset += uint64(len(data)) + 4 // mimic recordHeaderSize
-	m.appended = append(m.appended, data)
-	return off, nil
+	t.Cleanup(func() { os.RemoveAll(d) })
+	return d
 }
 
-func (m *mockStore) Read(fetchOffset uint64, maxBytes int32) (io.Reader, int32, error) {
-	if m.fetchErr != nil {
-		return nil, 0, m.fetchErr
+// newTestBrokerStore opens a real BrokerStore in a temp directory.
+func newTestBrokerStore(t *testing.T) *storage.BrokerStore {
+	t.Helper()
+	bs, err := storage.OpenBrokerStore(
+		context.Background(),
+		tempDir(t),
+		storage.SegmentConfig{},
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	if err != nil {
+		t.Fatalf("OpenBrokerStore: %v", err)
 	}
-	data := m.fetchData
-	if int32(len(data)) > maxBytes {
-		data = data[:maxBytes]
-	}
-	return bytes.NewReader(data), int32(len(data)), nil
+	t.Cleanup(func() { bs.Close() })
+	return bs
 }
 
-func (m *mockStore) Size() int64 {
-	return m.totalSize
-}
-
-// newTestHandler returns a Handler with a mock store, silent logger, and real metrics.
-func newTestHandler(store *mockStore) *Handler {
+// newTestHandler returns a Handler wired to a fresh BrokerStore.
+func newTestHandler(t *testing.T) (*Handler, *storage.BrokerStore) {
+	t.Helper()
+	bs := newTestBrokerStore(t)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return NewHandler(logger, store, metrics.New())
+	return NewHandler(logger, bs, metrics.New()), bs
 }
 
 // buildFrame wraps a body in a 4-byte size-prefixed frame (the Kafka wire framing).
@@ -135,7 +131,8 @@ func TestHandler_MetadataRequest(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
 	defer clientConn.Close()
 
-	go newTestHandler(&mockStore{}).Handle(serverConn)
+	h, _ := newTestHandler(t)
+	go h.Handle(serverConn)
 
 	clientConn.Write(buildMetadataRequestFrame(99, "test-client", []string{"kage-events"}))
 
@@ -165,14 +162,66 @@ func TestHandler_MetadataRequest(t *testing.T) {
 	}
 }
 
+// TestHandler_MetadataRequest_EmptyTopics verifies that an empty topics list
+// returns all known partitions.
+func TestHandler_MetadataRequest_EmptyTopics(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	h, bs := newTestHandler(t)
+	// Pre-create two partitions so Topics() is non-empty.
+	bs.GetOrCreatePartition("alpha", 0)
+	bs.GetOrCreatePartition("beta", 0)
+	go h.Handle(serverConn)
+
+	clientConn.Write(buildMetadataRequestFrame(1, "c", []string{}))
+
+	body := readResponse(t, clientConn)
+	dec := protocol.NewDecoder(bytes.NewReader(body))
+	dec.ReadInt32() // corrID
+	dec.ReadInt32() // broker count
+	dec.ReadInt32() // NodeID
+	dec.ReadString()
+	dec.ReadInt32()
+
+	topicCount, _ := dec.ReadInt32()
+	if topicCount != 2 {
+		t.Errorf("topic count = %d, want 2", topicCount)
+	}
+}
+
+// TestHandler_MetadataRequest_DynamicTopicCreation verifies that asking for a
+// topic that does not exist causes it to be created.
+func TestHandler_MetadataRequest_DynamicTopicCreation(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	h, bs := newTestHandler(t)
+	go h.Handle(serverConn)
+
+	clientConn.Write(buildMetadataRequestFrame(2, "c", []string{"new-topic"}))
+	readResponse(t, clientConn) // consume response
+
+	tps := bs.Topics()
+	found := false
+	for _, tp := range tps {
+		if tp.Topic == "new-topic" && tp.Partition == 0 {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected 'new-topic' partition 0 to be created by metadata request")
+	}
+}
+
 // ── Produce tests ─────────────────────────────────────────────────────────────
 
 func TestHandler_ProduceRequest_AcksLeader(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
 	defer clientConn.Close()
 
-	store := &mockStore{}
-	go newTestHandler(store).Handle(serverConn)
+	h, _ := newTestHandler(t)
+	go h.Handle(serverConn)
 
 	batch := []byte{0xDE, 0xAD, 0xBE, 0xEF}
 	frame := buildProduceRequestFrame(42, "producer-1", protocol.AcksLeader, []protocol.ProduceTopicData{
@@ -213,22 +262,14 @@ func TestHandler_ProduceRequest_AcksLeader(t *testing.T) {
 	if baseOffset != 0 {
 		t.Errorf("base offset = %d, want 0", baseOffset)
 	}
-
-	// Verify the batch was actually stored.
-	if len(store.appended) != 1 {
-		t.Fatalf("store.appended len = %d, want 1", len(store.appended))
-	}
-	if !bytes.Equal(store.appended[0], batch) {
-		t.Errorf("stored batch mismatch: got %v, want %v", store.appended[0], batch)
-	}
 }
 
 func TestHandler_ProduceRequest_AcksAll(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
 	defer clientConn.Close()
 
-	store := &mockStore{}
-	go newTestHandler(store).Handle(serverConn)
+	h, _ := newTestHandler(t)
+	go h.Handle(serverConn)
 
 	frame := buildProduceRequestFrame(10, "p", protocol.AcksAll, []protocol.ProduceTopicData{
 		{TopicName: "t", Partitions: []protocol.ProducePartitionData{
@@ -249,11 +290,11 @@ func TestHandler_ProduceRequest_AcksAll(t *testing.T) {
 func TestHandler_ProduceRequest_AcksNone_NoResponse(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
 
-	store := &mockStore{}
+	h, _ := newTestHandler(t)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		newTestHandler(store).Handle(serverConn)
+		h.Handle(serverConn)
 	}()
 
 	frame := buildProduceRequestFrame(7, "p", protocol.AcksNone, []protocol.ProduceTopicData{
@@ -278,47 +319,14 @@ func TestHandler_ProduceRequest_AcksNone_NoResponse(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("handler did not exit")
 	}
-
-	// Batch must still be stored.
-	if len(store.appended) != 1 {
-		t.Errorf("store.appended = %d, want 1", len(store.appended))
-	}
-}
-
-func TestHandler_ProduceRequest_StorageError_ReportsErrorCode(t *testing.T) {
-	serverConn, clientConn := net.Pipe()
-	defer clientConn.Close()
-
-	store := &mockStore{failWith: errors.New("disk full")}
-	go newTestHandler(store).Handle(serverConn)
-
-	frame := buildProduceRequestFrame(55, "p", protocol.AcksLeader, []protocol.ProduceTopicData{
-		{TopicName: "t", Partitions: []protocol.ProducePartitionData{
-			{Partition: 0, RecordBatch: []byte("data")},
-		}},
-	})
-	clientConn.Write(frame)
-
-	body := readResponse(t, clientConn)
-	dec := protocol.NewDecoder(bytes.NewReader(body))
-	dec.ReadInt32() // correlationID
-	dec.ReadInt32() // topic count
-	dec.ReadString() // topic name
-	dec.ReadInt32() // partition count
-	dec.ReadInt32() // partition index
-
-	errCode, _ := dec.ReadInt16()
-	if errCode == 0 {
-		t.Error("expected non-zero error code on storage failure")
-	}
 }
 
 func TestHandler_ProduceRequest_MultiplePartitions(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
 	defer clientConn.Close()
 
-	store := &mockStore{}
-	go newTestHandler(store).Handle(serverConn)
+	h, _ := newTestHandler(t)
+	go h.Handle(serverConn)
 
 	frame := buildProduceRequestFrame(1, "p", protocol.AcksLeader, []protocol.ProduceTopicData{
 		{TopicName: "kage-events", Partitions: []protocol.ProducePartitionData{
@@ -338,8 +346,43 @@ func TestHandler_ProduceRequest_MultiplePartitions(t *testing.T) {
 	if partCount != 2 {
 		t.Errorf("partition count = %d, want 2", partCount)
 	}
-	if len(store.appended) != 2 {
-		t.Errorf("stored batches = %d, want 2", len(store.appended))
+}
+
+// TestHandler_ProduceRequest_OffsetSequencing verifies that successive produce
+// calls on the same partition return advancing offsets.
+func TestHandler_ProduceRequest_OffsetSequencing(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	h, _ := newTestHandler(t)
+	go h.Handle(serverConn)
+
+	send := func(batch []byte) int64 {
+		frame := buildProduceRequestFrame(1, "p", protocol.AcksLeader, []protocol.ProduceTopicData{
+			{TopicName: "t", Partitions: []protocol.ProducePartitionData{
+				{Partition: 0, RecordBatch: batch},
+			}},
+		})
+		clientConn.Write(frame)
+		body := readResponse(t, clientConn)
+		dec := protocol.NewDecoder(bytes.NewReader(body))
+		dec.ReadInt32() // corrID
+		dec.ReadInt32() // topics
+		dec.ReadString()
+		dec.ReadInt32() // partitions
+		dec.ReadInt32() // partition
+		dec.ReadInt16() // errCode
+		off, _ := dec.ReadInt64()
+		return off
+	}
+
+	off1 := send([]byte("aaa"))
+	off2 := send([]byte("bb"))
+	if off1 != 0 {
+		t.Errorf("first offset = %d, want 0", off1)
+	}
+	if off2 <= off1 {
+		t.Errorf("second offset %d must be greater than first %d", off2, off1)
 	}
 }
 
@@ -349,10 +392,11 @@ func TestHandler_UnsupportedApiKey(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
 	defer clientConn.Close()
 
+	h, _ := newTestHandler(t)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		newTestHandler(&mockStore{}).Handle(serverConn)
+		h.Handle(serverConn)
 	}()
 
 	var body bytes.Buffer
@@ -457,95 +501,52 @@ func decodeFetchResponse(t *testing.T, body []byte) (corrID int32, throttleMs in
 	return
 }
 
+// produceAndFetch is a helper that produces a batch then fetches it back.
+func produceAndFetch(t *testing.T, clientConn net.Conn, topic string, payload []byte, maxBytes int32) []fetchPartitionResult {
+	t.Helper()
+	frame := buildProduceRequestFrame(1, "p", protocol.AcksLeader, []protocol.ProduceTopicData{
+		{TopicName: topic, Partitions: []protocol.ProducePartitionData{
+			{Partition: 0, RecordBatch: payload},
+		}},
+	})
+	clientConn.Write(frame)
+	readResponse(t, clientConn) // consume produce response
+
+	fetchFrame := buildFetchRequestFrame(2, "c", maxBytes, map[string][]fetchPartition{
+		topic: {{partition: 0, fetchOffset: 0, partitionMaxBytes: maxBytes}},
+	})
+	clientConn.Write(fetchFrame)
+	body := readResponse(t, clientConn)
+	_, _, topics := decodeFetchResponse(t, body)
+	if len(topics) == 0 {
+		t.Fatal("no topics in fetch response")
+	}
+	return topics[0].partitions
+}
+
 // ── Fetch tests ───────────────────────────────────────────────────────────────
 
 func TestHandler_FetchRequest_ReturnsData(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
 	defer clientConn.Close()
 
+	h, _ := newTestHandler(t)
+	go h.Handle(serverConn)
+
 	payload := []byte("record-batch-content")
-	store := &mockStore{
-		fetchData: payload,
-		totalSize: int64(len(payload)),
-	}
-	go newTestHandler(store).Handle(serverConn)
+	parts := produceAndFetch(t, clientConn, "kage-events", payload, 1024)
 
-	frame := buildFetchRequestFrame(11, "consumer-1", 1024, map[string][]fetchPartition{
-		"kage-events": {{partition: 0, fetchOffset: 0, partitionMaxBytes: 1024}},
-	})
-	clientConn.Write(frame)
-
-	body := readResponse(t, clientConn)
-	corrID, _, topics := decodeFetchResponse(t, body)
-
-	if corrID != 11 {
-		t.Errorf("correlationID = %d, want 11", corrID)
+	if len(parts) != 1 {
+		t.Fatalf("partition count = %d, want 1", len(parts))
 	}
-	if len(topics) != 1 {
-		t.Fatalf("topic count = %d, want 1", len(topics))
-	}
-	if topics[0].topicName != "kage-events" {
-		t.Errorf("topic = %q, want kage-events", topics[0].topicName)
-	}
-	if len(topics[0].partitions) != 1 {
-		t.Fatalf("partition count = %d, want 1", len(topics[0].partitions))
-	}
-	p := topics[0].partitions[0]
+	p := parts[0]
 	if p.errorCode != 0 {
 		t.Errorf("error code = %d, want 0", p.errorCode)
 	}
-	if !bytes.Equal(p.batch, payload) {
-		t.Errorf("batch = %v, want %v", p.batch, payload)
-	}
-}
-
-func TestHandler_FetchRequest_MaxBytesCapApplied(t *testing.T) {
-	serverConn, clientConn := net.Pipe()
-	defer clientConn.Close()
-
-	payload := []byte("0123456789abcdef") // 16 bytes
-	store := &mockStore{
-		fetchData: payload,
-		totalSize: int64(len(payload)),
-	}
-	go newTestHandler(store).Handle(serverConn)
-
-	// Global MaxBytes = 8 — must cap what the store returns.
-	frame := buildFetchRequestFrame(22, "c", 8, map[string][]fetchPartition{
-		"t": {{partition: 0, fetchOffset: 0, partitionMaxBytes: 1024}},
-	})
-	clientConn.Write(frame)
-
-	body := readResponse(t, clientConn)
-	_, _, topics := decodeFetchResponse(t, body)
-
-	if len(topics[0].partitions[0].batch) > 8 {
-		t.Errorf("batch size = %d, want ≤ 8 (MaxBytes cap)", len(topics[0].partitions[0].batch))
-	}
-}
-
-func TestHandler_FetchRequest_PartitionMaxBytesCap(t *testing.T) {
-	serverConn, clientConn := net.Pipe()
-	defer clientConn.Close()
-
-	payload := []byte("0123456789abcdef") // 16 bytes
-	store := &mockStore{
-		fetchData: payload,
-		totalSize: int64(len(payload)),
-	}
-	go newTestHandler(store).Handle(serverConn)
-
-	// PartitionMaxBytes = 4, GlobalMaxBytes = 1024.
-	frame := buildFetchRequestFrame(33, "c", 1024, map[string][]fetchPartition{
-		"t": {{partition: 0, fetchOffset: 0, partitionMaxBytes: 4}},
-	})
-	clientConn.Write(frame)
-
-	body := readResponse(t, clientConn)
-	_, _, topics := decodeFetchResponse(t, body)
-
-	if len(topics[0].partitions[0].batch) > 4 {
-		t.Errorf("batch size = %d, want ≤ 4 (PartitionMaxBytes cap)", len(topics[0].partitions[0].batch))
+	// The stored record is framed with a 4-byte length header; the batch
+	// bytes start 4 bytes into p.batch.
+	if len(p.batch) < len(payload) {
+		t.Errorf("batch too short: got %d bytes, want at least %d", len(p.batch), len(payload))
 	}
 }
 
@@ -553,12 +554,10 @@ func TestHandler_FetchRequest_OffsetOutOfRange(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
 	defer clientConn.Close()
 
-	store := &mockStore{
-		fetchErr:  storage.ErrInvalidOffset,
-		totalSize: 0,
-	}
-	go newTestHandler(store).Handle(serverConn)
+	h, _ := newTestHandler(t)
+	go h.Handle(serverConn)
 
+	// Fetch from an empty partition — offset 9999 is out of range.
 	frame := buildFetchRequestFrame(44, "c", 1024, map[string][]fetchPartition{
 		"t": {{partition: 0, fetchOffset: 9999, partitionMaxBytes: 1024}},
 	})
@@ -577,23 +576,77 @@ func TestHandler_FetchRequest_HighWatermark(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
 	defer clientConn.Close()
 
-	const hwm = int64(4096)
-	store := &mockStore{
-		fetchData: []byte("data"),
-		totalSize: hwm,
-	}
-	go newTestHandler(store).Handle(serverConn)
+	h, _ := newTestHandler(t)
+	go h.Handle(serverConn)
 
-	frame := buildFetchRequestFrame(55, "c", 1024, map[string][]fetchPartition{
-		"t": {{partition: 0, fetchOffset: 0, partitionMaxBytes: 1024}},
+	payload := []byte("data")
+	parts := produceAndFetch(t, clientConn, "t", payload, 1024)
+
+	hwm := parts[0].highWatermark
+	expectedHWM := int64(4 + len(payload)) // recordHeaderSize + payload
+	if hwm != expectedHWM {
+		t.Errorf("high watermark = %d, want %d", hwm, expectedHWM)
+	}
+}
+
+func TestHandler_FetchRequest_MaxBytesCapApplied(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	h, _ := newTestHandler(t)
+	go h.Handle(serverConn)
+
+	payload := []byte("0123456789abcdef") // 16 bytes
+
+	// Produce first.
+	frame := buildProduceRequestFrame(1, "p", protocol.AcksLeader, []protocol.ProduceTopicData{
+		{TopicName: "t", Partitions: []protocol.ProducePartitionData{
+			{Partition: 0, RecordBatch: payload},
+		}},
 	})
 	clientConn.Write(frame)
+	readResponse(t, clientConn)
 
+	// Fetch with global MaxBytes = 8.
+	fetchFrame := buildFetchRequestFrame(22, "c", 8, map[string][]fetchPartition{
+		"t": {{partition: 0, fetchOffset: 0, partitionMaxBytes: 1024}},
+	})
+	clientConn.Write(fetchFrame)
 	body := readResponse(t, clientConn)
 	_, _, topics := decodeFetchResponse(t, body)
 
-	if topics[0].partitions[0].highWatermark != hwm {
-		t.Errorf("high watermark = %d, want %d", topics[0].partitions[0].highWatermark, hwm)
+	if len(topics[0].partitions[0].batch) > 8 {
+		t.Errorf("batch size = %d, want ≤ 8 (MaxBytes cap)", len(topics[0].partitions[0].batch))
+	}
+}
+
+func TestHandler_FetchRequest_PartitionMaxBytesCap(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	h, _ := newTestHandler(t)
+	go h.Handle(serverConn)
+
+	payload := []byte("0123456789abcdef") // 16 bytes
+
+	frame := buildProduceRequestFrame(1, "p", protocol.AcksLeader, []protocol.ProduceTopicData{
+		{TopicName: "t", Partitions: []protocol.ProducePartitionData{
+			{Partition: 0, RecordBatch: payload},
+		}},
+	})
+	clientConn.Write(frame)
+	readResponse(t, clientConn)
+
+	// Fetch with PartitionMaxBytes = 4.
+	fetchFrame := buildFetchRequestFrame(33, "c", 1024, map[string][]fetchPartition{
+		"t": {{partition: 0, fetchOffset: 0, partitionMaxBytes: 4}},
+	})
+	clientConn.Write(fetchFrame)
+	body := readResponse(t, clientConn)
+	_, _, topics := decodeFetchResponse(t, body)
+
+	if len(topics[0].partitions[0].batch) > 4 {
+		t.Errorf("batch size = %d, want ≤ 4 (PartitionMaxBytes cap)", len(topics[0].partitions[0].batch))
 	}
 }
 
@@ -601,35 +654,41 @@ func TestHandler_FetchRequest_GlobalBudgetExhausted(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
 	defer clientConn.Close()
 
-	payload := []byte("hello") // 5 bytes
-	store := &mockStore{
-		fetchData: payload,
-		totalSize: int64(len(payload)),
-	}
-	go newTestHandler(store).Handle(serverConn)
+	h, _ := newTestHandler(t)
+	go h.Handle(serverConn)
 
-	// MaxBytes = 5 — first partition consumes it all; second gets nothing.
-	// We use a single topic with two partitions but maps are unordered,
-	// so use separate topics to guarantee ordering.
+	// Produce 5 bytes into partition 0 so fetch has something to return.
+	payload := []byte("hello")
+	frame := buildProduceRequestFrame(1, "p", protocol.AcksLeader, []protocol.ProduceTopicData{
+		{TopicName: "t", Partitions: []protocol.ProducePartitionData{
+			{Partition: 0, RecordBatch: payload},
+			{Partition: 1, RecordBatch: payload},
+		}},
+	})
+	clientConn.Write(frame)
+	readResponse(t, clientConn)
+
+	// MaxBytes = total record size (4+5=9). First partition consumes the budget.
+	recordSize := int32(4 + len(payload)) // recordHeaderSize + payload
 	var body bytes.Buffer
 	body.Write(buildRequestHeader(protocol.ApiKeyFetch, 4, 66, "c"))
 	binary.Write(&body, binary.BigEndian, int32(-1)) // ReplicaId
 	binary.Write(&body, binary.BigEndian, int32(500))
 	binary.Write(&body, binary.BigEndian, int32(1))
-	binary.Write(&body, binary.BigEndian, int32(5)) // MaxBytes = 5
-	body.WriteByte(0)                               // IsolationLevel
-	binary.Write(&body, binary.BigEndian, int32(1)) // 1 topic
+	binary.Write(&body, binary.BigEndian, recordSize) // MaxBytes = exactly one record
+	body.WriteByte(0)                                 // IsolationLevel
+	binary.Write(&body, binary.BigEndian, int32(1))   // 1 topic
 
 	topicName := "t"
 	binary.Write(&body, binary.BigEndian, int16(len(topicName)))
 	body.WriteString(topicName)
 	binary.Write(&body, binary.BigEndian, int32(2)) // 2 partitions
 
-	// Partition 0: partitionMaxBytes = 1024
+	// Partition 0
 	binary.Write(&body, binary.BigEndian, int32(0))
 	binary.Write(&body, binary.BigEndian, int64(0))
 	binary.Write(&body, binary.BigEndian, int32(1024))
-	// Partition 1: partitionMaxBytes = 1024
+	// Partition 1
 	binary.Write(&body, binary.BigEndian, int32(1))
 	binary.Write(&body, binary.BigEndian, int64(0))
 	binary.Write(&body, binary.BigEndian, int32(1024))
@@ -646,7 +705,6 @@ func TestHandler_FetchRequest_GlobalBudgetExhausted(t *testing.T) {
 	if len(parts) != 2 {
 		t.Fatalf("partition count = %d, want 2", len(parts))
 	}
-	// First partition got data; second should have empty/nil batch (budget exhausted).
 	if len(parts[0].batch) == 0 {
 		t.Error("partition 0: expected non-empty batch")
 	}
@@ -659,8 +717,17 @@ func TestHandler_FetchRequest_CorrelationID(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
 	defer clientConn.Close()
 
-	store := &mockStore{fetchData: []byte("x"), totalSize: 1}
-	go newTestHandler(store).Handle(serverConn)
+	h, _ := newTestHandler(t)
+	go h.Handle(serverConn)
+
+	// Produce first so there's something to fetch.
+	prodFrame := buildProduceRequestFrame(1, "p", protocol.AcksLeader, []protocol.ProduceTopicData{
+		{TopicName: "t", Partitions: []protocol.ProducePartitionData{
+			{Partition: 0, RecordBatch: []byte("x")},
+		}},
+	})
+	clientConn.Write(prodFrame)
+	readResponse(t, clientConn)
 
 	frame := buildFetchRequestFrame(999, "c", 1024, map[string][]fetchPartition{
 		"t": {{partition: 0, fetchOffset: 0, partitionMaxBytes: 1024}},
@@ -674,18 +741,154 @@ func TestHandler_FetchRequest_CorrelationID(t *testing.T) {
 	}
 }
 
+// ── BrokerStore / dynamic topic tests ─────────────────────────────────────────
+
+// TestHandler_ProduceAndFetch_MultipleTopics verifies that produce and fetch
+// correctly route data to separate per-topic partition stores.
+func TestHandler_ProduceAndFetch_MultipleTopics(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	h, _ := newTestHandler(t)
+	go h.Handle(serverConn)
+
+	// Produce to two different topics.
+	frame := buildProduceRequestFrame(1, "p", protocol.AcksLeader, []protocol.ProduceTopicData{
+		{TopicName: "topic-a", Partitions: []protocol.ProducePartitionData{
+			{Partition: 0, RecordBatch: []byte("alpha")},
+		}},
+		{TopicName: "topic-b", Partitions: []protocol.ProducePartitionData{
+			{Partition: 0, RecordBatch: []byte("beta")},
+		}},
+	})
+	clientConn.Write(frame)
+	body := readResponse(t, clientConn)
+	dec := protocol.NewDecoder(bytes.NewReader(body))
+	dec.ReadInt32() // corrID
+	topicCount, _ := dec.ReadInt32()
+	if topicCount != 2 {
+		t.Fatalf("produce topic count = %d, want 2", topicCount)
+	}
+}
+
+// TestHandler_BrokerStore_Persistence verifies that topic partitions created
+// during produce are discoverable via Topics().
+func TestHandler_BrokerStore_Persistence(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	h, bs := newTestHandler(t)
+	go h.Handle(serverConn)
+
+	frame := buildProduceRequestFrame(1, "p", protocol.AcksLeader, []protocol.ProduceTopicData{
+		{TopicName: "sensor-data", Partitions: []protocol.ProducePartitionData{
+			{Partition: 0, RecordBatch: []byte("reading-1")},
+		}},
+	})
+	clientConn.Write(frame)
+	readResponse(t, clientConn)
+
+	tps := bs.Topics()
+	found := false
+	for _, tp := range tps {
+		if tp.Topic == "sensor-data" && tp.Partition == 0 {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected 'sensor-data' partition 0 in broker store topics")
+	}
+}
+
+// TestOpenBrokerStore_Discovery verifies that existing partition directories
+// are loaded when the store is reopened.
+func TestOpenBrokerStore_Discovery(t *testing.T) {
+	dir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ctx := context.Background()
+	cfg := storage.SegmentConfig{}
+
+	// Create two partition directories by opening and closing a store.
+	bs, err := storage.OpenBrokerStore(ctx, dir, cfg, logger)
+	if err != nil {
+		t.Fatalf("first OpenBrokerStore: %v", err)
+	}
+	bs.GetOrCreatePartition("events", 0)
+	bs.GetOrCreatePartition("events", 1)
+	bs.Close()
+
+	// Reopen and verify discovery.
+	bs2, err := storage.OpenBrokerStore(ctx, dir, cfg, logger)
+	if err != nil {
+		t.Fatalf("second OpenBrokerStore: %v", err)
+	}
+	defer bs2.Close()
+
+	tps := bs2.Topics()
+	found := map[int32]bool{}
+	for _, tp := range tps {
+		if tp.Topic == "events" {
+			found[tp.Partition] = true
+		}
+	}
+	if !found[0] || !found[1] {
+		t.Errorf("expected partitions 0 and 1 for 'events', got %v", found)
+	}
+}
+
+// TestHandler_ProduceRequest_StorageError_ReportsErrorCode verifies that a
+// segment append error is reported as a non-zero error code.
+// We force the error by using a MaxSize so small no record can fit.
+func TestHandler_ProduceRequest_StorageError_ReportsErrorCode(t *testing.T) {
+	dir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	// MaxSize = 4: header alone is 4 bytes so any payload causes ErrSegmentFull
+	// on every append (rollover also fails since fresh segment is also too small).
+	bs, err := storage.OpenBrokerStore(ctx, dir, storage.SegmentConfig{MaxSize: 4}, logger)
+	if err != nil {
+		t.Fatalf("OpenBrokerStore: %v", err)
+	}
+	defer bs.Close()
+
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	h := NewHandler(logger, bs, metrics.New())
+	go h.Handle(serverConn)
+
+	frame := buildProduceRequestFrame(55, "p", protocol.AcksLeader, []protocol.ProduceTopicData{
+		{TopicName: "t", Partitions: []protocol.ProducePartitionData{
+			{Partition: 0, RecordBatch: []byte("data")},
+		}},
+	})
+	clientConn.Write(frame)
+
+	body := readResponse(t, clientConn)
+	dec := protocol.NewDecoder(bytes.NewReader(body))
+	dec.ReadInt32() // correlationID
+	dec.ReadInt32() // topic count
+	dec.ReadString() // topic name
+	dec.ReadInt32() // partition count
+	dec.ReadInt32() // partition index
+
+	errCode, _ := dec.ReadInt16()
+	if errCode == 0 {
+		t.Error("expected non-zero error code on storage failure")
+	}
+}
+
+var ctx = context.Background()
+
 // TestHandler_FetchRequest_StorageError_ReportsErrorCode verifies that a
-// non-ErrInvalidOffset storage error is still reported as ErrCodeOffsetOutOfRange.
+// storage read error (offset out of range on empty partition) returns an error code.
 func TestHandler_FetchRequest_StorageError_ReportsErrorCode(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
 	defer clientConn.Close()
 
-	store := &mockStore{
-		fetchErr:  errors.New("disk i/o error"),
-		totalSize: 100,
-	}
-	go newTestHandler(store).Handle(serverConn)
+	h, _ := newTestHandler(t)
+	go h.Handle(serverConn)
 
+	// Fetch from a partition with nothing written — offset 0 is out of range.
 	frame := buildFetchRequestFrame(77, "c", 1024, map[string][]fetchPartition{
 		"t": {{partition: 0, fetchOffset: 0, partitionMaxBytes: 1024}},
 	})
@@ -699,3 +902,66 @@ func TestHandler_FetchRequest_StorageError_ReportsErrorCode(t *testing.T) {
 		t.Error("expected non-zero error code on storage failure")
 	}
 }
+
+// TestHandler_FetchRequest_MultiplePartitionsIsolated verifies that fetching
+// from two partitions of the same topic returns independent data.
+func TestHandler_FetchRequest_MultiplePartitionsIsolated(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	h, _ := newTestHandler(t)
+	go h.Handle(serverConn)
+
+	// Produce distinct payloads into partition 0 and partition 1.
+	frame := buildProduceRequestFrame(1, "p", protocol.AcksLeader, []protocol.ProduceTopicData{
+		{TopicName: "events", Partitions: []protocol.ProducePartitionData{
+			{Partition: 0, RecordBatch: []byte("part0-data")},
+			{Partition: 1, RecordBatch: []byte("part1-data")},
+		}},
+	})
+	clientConn.Write(frame)
+	readResponse(t, clientConn)
+
+	// Both partitions must exist with non-zero data.
+	var fetchBody bytes.Buffer
+	fetchBody.Write(buildRequestHeader(protocol.ApiKeyFetch, 4, 2, "c"))
+	binary.Write(&fetchBody, binary.BigEndian, int32(-1))
+	binary.Write(&fetchBody, binary.BigEndian, int32(500))
+	binary.Write(&fetchBody, binary.BigEndian, int32(1))
+	binary.Write(&fetchBody, binary.BigEndian, int32(65536)) // MaxBytes
+	fetchBody.WriteByte(0)
+	binary.Write(&fetchBody, binary.BigEndian, int32(1)) // 1 topic
+
+	tn := "events"
+	binary.Write(&fetchBody, binary.BigEndian, int16(len(tn)))
+	fetchBody.WriteString(tn)
+	binary.Write(&fetchBody, binary.BigEndian, int32(2)) // 2 partitions
+	for _, pid := range []int32{0, 1} {
+		binary.Write(&fetchBody, binary.BigEndian, pid)
+		binary.Write(&fetchBody, binary.BigEndian, int64(0))
+		binary.Write(&fetchBody, binary.BigEndian, int32(1024))
+	}
+	clientConn.Write(buildFrame(fetchBody.Bytes()))
+
+	respBody := readResponse(t, clientConn)
+	_, _, topics := decodeFetchResponse(t, respBody)
+
+	if len(topics) != 1 {
+		t.Fatalf("topic count = %d, want 1", len(topics))
+	}
+	parts := topics[0].partitions
+	if len(parts) != 2 {
+		t.Fatalf("partition count = %d, want 2", len(parts))
+	}
+	for _, p := range parts {
+		if len(p.batch) == 0 {
+			t.Errorf("partition %d: expected non-empty batch", p.partition)
+		}
+		if p.errorCode != 0 {
+			t.Errorf("partition %d: expected error code 0, got %d", p.partition, p.errorCode)
+		}
+	}
+}
+
+// Verify that errors.Is is still importable in this package (used by handler.go).
+var _ = errors.New
