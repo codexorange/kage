@@ -5,6 +5,7 @@ import "fmt"
 // API keys
 const (
 	ApiKeyProduce  int16 = 0
+	ApiKeyFetch    int16 = 1
 	ApiKeyMetadata int16 = 3
 )
 
@@ -272,6 +273,188 @@ func (e *Encoder) EncodeProduceResponse(correlationID int32, resp *ProduceRespon
 			e.WriteInt32(p.Partition)
 			e.WriteInt16(p.ErrorCode)
 			e.WriteInt64(p.BaseOffset)
+		}
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// FetchRequest (ApiKey 1, v4)
+// ──────────────────────────────────────────────────────────────────────────────
+
+// FetchPartitionData holds the fetch parameters for one partition.
+type FetchPartitionData struct {
+	Partition          int32
+	FetchOffset        int64 // byte offset in the log to start reading from
+	PartitionMaxBytes  int32 // max bytes to return for this partition
+}
+
+// FetchTopicData groups partition fetch requests under a single topic name.
+type FetchTopicData struct {
+	TopicName  string
+	Partitions []FetchPartitionData
+}
+
+// FetchRequest (v4) wire layout after the request header:
+//
+//	ReplicaId      int32   (always -1 from consumers)
+//	MaxWaitMs      int32
+//	MinBytes       int32
+//	MaxBytes       int32
+//	IsolationLevel int8
+//	topics[]
+//	  TopicName           string
+//	  partitions[]
+//	    Partition         int32
+//	    FetchOffset       int64
+//	    PartitionMaxBytes int32
+type FetchRequest struct {
+	Header         *RequestHeader
+	ReplicaID      int32
+	MaxWaitMs      int32
+	MinBytes       int32
+	MaxBytes       int32
+	IsolationLevel int8
+	Topics         []FetchTopicData
+}
+
+// ParseFetchRequest reads a FetchRequest v4 body after the header.
+func (d *Decoder) ParseFetchRequest(header *RequestHeader) (*FetchRequest, error) {
+	replicaID, err := d.ReadInt32()
+	if err != nil {
+		return nil, fmt.Errorf("fetch request: read replica_id: %w", err)
+	}
+
+	maxWaitMs, err := d.ReadInt32()
+	if err != nil {
+		return nil, fmt.Errorf("fetch request: read max_wait_ms: %w", err)
+	}
+
+	minBytes, err := d.ReadInt32()
+	if err != nil {
+		return nil, fmt.Errorf("fetch request: read min_bytes: %w", err)
+	}
+
+	maxBytes, err := d.ReadInt32()
+	if err != nil {
+		return nil, fmt.Errorf("fetch request: read max_bytes: %w", err)
+	}
+
+	isolationLevel, err := d.ReadInt8()
+	if err != nil {
+		return nil, fmt.Errorf("fetch request: read isolation_level: %w", err)
+	}
+
+	topicCount, err := d.ReadInt32()
+	if err != nil {
+		return nil, fmt.Errorf("fetch request: read topic count: %w", err)
+	}
+
+	topics := make([]FetchTopicData, 0, topicCount)
+	for i := int32(0); i < topicCount; i++ {
+		topicName, err := d.ReadString()
+		if err != nil {
+			return nil, fmt.Errorf("fetch request: topic[%d] name: %w", i, err)
+		}
+
+		partCount, err := d.ReadInt32()
+		if err != nil {
+			return nil, fmt.Errorf("fetch request: topic[%d] partition count: %w", i, err)
+		}
+
+		partitions := make([]FetchPartitionData, 0, partCount)
+		for j := int32(0); j < partCount; j++ {
+			partition, err := d.ReadInt32()
+			if err != nil {
+				return nil, fmt.Errorf("fetch request: topic[%d] partition[%d] index: %w", i, j, err)
+			}
+			fetchOffset, err := d.ReadInt64()
+			if err != nil {
+				return nil, fmt.Errorf("fetch request: topic[%d] partition[%d] fetch_offset: %w", i, j, err)
+			}
+			partMaxBytes, err := d.ReadInt32()
+			if err != nil {
+				return nil, fmt.Errorf("fetch request: topic[%d] partition[%d] partition_max_bytes: %w", i, j, err)
+			}
+			partitions = append(partitions, FetchPartitionData{
+				Partition:         partition,
+				FetchOffset:       fetchOffset,
+				PartitionMaxBytes: partMaxBytes,
+			})
+		}
+		topics = append(topics, FetchTopicData{TopicName: topicName, Partitions: partitions})
+	}
+
+	return &FetchRequest{
+		Header:         header,
+		ReplicaID:      replicaID,
+		MaxWaitMs:      maxWaitMs,
+		MinBytes:       minBytes,
+		MaxBytes:       maxBytes,
+		IsolationLevel: isolationLevel,
+		Topics:         topics,
+	}, nil
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// FetchResponse (ApiKey 1, v4)
+// ──────────────────────────────────────────────────────────────────────────────
+
+// Kafka error codes used in FetchResponse.
+const (
+	ErrCodeNone             int16 = 0
+	ErrCodeOffsetOutOfRange int16 = 1
+)
+
+// FetchPartitionResponse holds the result for one fetched partition.
+type FetchPartitionResponse struct {
+	Partition      int32
+	ErrorCode      int16
+	HighWatermark  int64  // byte size of the log (end of log position)
+	RecordBatch    []byte // raw record batch bytes; nil when ErrorCode != 0
+}
+
+// FetchTopicResponse groups partition results under a topic name.
+type FetchTopicResponse struct {
+	TopicName  string
+	Partitions []FetchPartitionResponse
+}
+
+// FetchResponse (v4) wire layout:
+//
+//	CorrelationID  int32
+//	ThrottleTimeMs int32
+//	topics[]
+//	  TopicName    string
+//	  partitions[]
+//	    Partition      int32
+//	    ErrorCode      int16
+//	    HighWatermark  int64
+//	    BatchSize      int32   (-1 when no records)
+//	    RecordBatch    []byte  (absent when BatchSize == -1)
+type FetchResponse struct {
+	ThrottleTimeMs int32
+	Topics         []FetchTopicResponse
+}
+
+// EncodeFetchResponse serialises a FetchResponse into the Encoder.
+func (e *Encoder) EncodeFetchResponse(correlationID int32, resp *FetchResponse) {
+	e.WriteInt32(correlationID)
+	e.WriteInt32(resp.ThrottleTimeMs)
+
+	e.WriteInt32(int32(len(resp.Topics)))
+	for _, t := range resp.Topics {
+		e.WriteString(t.TopicName)
+		e.WriteInt32(int32(len(t.Partitions)))
+		for _, p := range t.Partitions {
+			e.WriteInt32(p.Partition)
+			e.WriteInt16(p.ErrorCode)
+			e.WriteInt64(p.HighWatermark)
+			if p.RecordBatch == nil {
+				e.WriteInt32(-1) // null records
+			} else {
+				e.WriteInt32(int32(len(p.RecordBatch)))
+				e.WriteBytes(p.RecordBatch)
+			}
 		}
 	}
 }

@@ -2,6 +2,7 @@ package storage
 
 import (
 	"fmt"
+	"io"
 	"sync"
 )
 
@@ -11,6 +12,24 @@ type AppendStore interface {
 	// Append writes the raw RecordBatch bytes and returns the byte offset at
 	// which the record was written.
 	Append(data []byte) (offset uint64, err error)
+}
+
+// FetchStore is the interface the server layer uses to read record batches.
+// It is satisfied by *PartitionStore and can be faked in tests.
+type FetchStore interface {
+	// Read returns an io.Reader covering [fetchOffset, fetchOffset+maxBytes)
+	// in the log.  The caller is responsible for capping maxBytes before calling.
+	// Returns ErrInvalidOffset when fetchOffset is beyond the written data.
+	Read(fetchOffset uint64, maxBytes int32) (io.Reader, error)
+
+	// Size returns the total bytes written across all segments (high-watermark).
+	Size() int64
+}
+
+// Store combines read and write access to a single partition's log.
+type Store interface {
+	AppendStore
+	FetchStore
 }
 
 // PartitionStore manages the active Segment for a single topic-partition.
@@ -74,6 +93,37 @@ func (ps *PartitionStore) rollover() error {
 	}
 	ps.active = seg
 	return nil
+}
+
+// Read returns an io.Reader for the record batch starting at fetchOffset,
+// capped to maxBytes.  It reads from the active segment only; multi-segment
+// reads are not yet supported (the active segment holds the full log for now).
+//
+// fetchOffset is the byte offset returned by a prior Append call.
+// maxBytes caps how many bytes are served; it must be > 0.
+func (ps *PartitionStore) Read(fetchOffset uint64, maxBytes int32) (io.Reader, error) {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	segSize := ps.active.Size() // total bytes written (includes buffered data)
+	if int64(fetchOffset) >= segSize {
+		return nil, ErrInvalidOffset
+	}
+
+	// Cap the read window: don't read past the end of written data.
+	available := int64(segSize) - int64(fetchOffset)
+	if int64(maxBytes) > available {
+		maxBytes = int32(available)
+	}
+
+	return ps.active.Read(fetchOffset, maxBytes)
+}
+
+// Size returns the total bytes written to the active segment (high-watermark).
+func (ps *PartitionStore) Size() int64 {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	return ps.active.Size()
 }
 
 // Flush commits buffered writes to the OS for the active segment.

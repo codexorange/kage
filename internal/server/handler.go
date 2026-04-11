@@ -14,10 +14,10 @@ import (
 // Handler routes incoming Kafka requests to the appropriate response builder.
 type Handler struct {
 	logger *slog.Logger
-	store  storage.AppendStore
+	store  storage.Store
 }
 
-func NewHandler(logger *slog.Logger, store storage.AppendStore) *Handler {
+func NewHandler(logger *slog.Logger, store storage.Store) *Handler {
 	return &Handler{logger: logger, store: store}
 }
 
@@ -62,6 +62,8 @@ func (h *Handler) dispatch(conn net.Conn, dec *protocol.Decoder, header *protoco
 	switch header.ApiKey {
 	case protocol.ApiKeyProduce:
 		return h.handleProduce(conn, dec, header)
+	case protocol.ApiKeyFetch:
+		return h.handleFetch(conn, dec, header)
 	case protocol.ApiKeyMetadata:
 		return h.handleMetadata(conn, dec, header)
 	default:
@@ -81,7 +83,6 @@ func (h *Handler) handleProduce(conn net.Conn, dec *protocol.Decoder, header *pr
 		return fmt.Errorf("handleProduce: parse: %w", err)
 	}
 
-	// Build the response structure, collecting a result per topic-partition.
 	resp := &protocol.ProduceResponse{
 		Topics: make([]protocol.ProduceTopicResponse, 0, len(req.Topics)),
 	}
@@ -104,7 +105,7 @@ func (h *Handler) handleProduce(conn net.Conn, dec *protocol.Decoder, header *pr
 					"partition", part.Partition,
 					"error", err,
 				)
-				partResp.ErrorCode = 1 // OFFSET_OUT_OF_RANGE — generic storage error
+				partResp.ErrorCode = 1
 				partResp.BaseOffset = -1
 			} else {
 				partResp.ErrorCode = 0
@@ -130,6 +131,104 @@ func (h *Handler) handleProduce(conn net.Conn, dec *protocol.Decoder, header *pr
 	enc.EncodeProduceResponse(header.CorrelationID, resp)
 	if _, err := conn.Write(enc.FullMessage()); err != nil {
 		return fmt.Errorf("handleProduce: write response: %w", err)
+	}
+	return nil
+}
+
+// handleFetch processes a FetchRequest (ApiKey 1, v4).
+//
+// For each topic-partition requested:
+//   - Clamp the effective max bytes to min(PartitionMaxBytes, remaining global MaxBytes).
+//   - Read bytes from storage starting at FetchOffset.
+//   - On ErrInvalidOffset, respond with ErrCodeOffsetOutOfRange.
+//   - Decrement the global bytes budget after each successful read.
+func (h *Handler) handleFetch(conn net.Conn, dec *protocol.Decoder, header *protocol.RequestHeader) error {
+	req, err := dec.ParseFetchRequest(header)
+	if err != nil {
+		return fmt.Errorf("handleFetch: parse: %w", err)
+	}
+
+	// Global bytes budget across all partitions in this request.
+	remaining := req.MaxBytes
+
+	hwm := h.store.Size() // high-watermark: total bytes written
+
+	resp := &protocol.FetchResponse{
+		Topics: make([]protocol.FetchTopicResponse, 0, len(req.Topics)),
+	}
+
+	for _, topic := range req.Topics {
+		topicResp := protocol.FetchTopicResponse{
+			TopicName:  topic.TopicName,
+			Partitions: make([]protocol.FetchPartitionResponse, 0, len(topic.Partitions)),
+		}
+
+		for _, part := range topic.Partitions {
+			partResp := protocol.FetchPartitionResponse{
+				Partition:     part.Partition,
+				HighWatermark: hwm,
+			}
+
+			// Effective cap: the smaller of the per-partition limit and what's
+			// left of the global budget.
+			cap := part.PartitionMaxBytes
+			if remaining < cap {
+				cap = remaining
+			}
+
+			if cap <= 0 {
+				// Global budget exhausted — return empty records for remaining partitions.
+				partResp.ErrorCode = protocol.ErrCodeNone
+				topicResp.Partitions = append(topicResp.Partitions, partResp)
+				continue
+			}
+
+			r, err := h.store.Read(uint64(part.FetchOffset), cap)
+			if err != nil {
+				if errors.Is(err, storage.ErrInvalidOffset) {
+					h.logger.Warn("fetch: offset out of range",
+						"topic", topic.TopicName,
+						"partition", part.Partition,
+						"fetch_offset", part.FetchOffset,
+					)
+					partResp.ErrorCode = protocol.ErrCodeOffsetOutOfRange
+				} else {
+					h.logger.Error("fetch: storage read failed",
+						"topic", topic.TopicName,
+						"partition", part.Partition,
+						"error", err,
+					)
+					partResp.ErrorCode = protocol.ErrCodeOffsetOutOfRange
+				}
+				topicResp.Partitions = append(topicResp.Partitions, partResp)
+				continue
+			}
+
+			batch, err := io.ReadAll(r)
+			if err != nil {
+				return fmt.Errorf("handleFetch: read batch: %w", err)
+			}
+
+			partResp.ErrorCode = protocol.ErrCodeNone
+			partResp.RecordBatch = batch
+			remaining -= int32(len(batch))
+
+			h.logger.Info("fetch: batch served",
+				"topic", topic.TopicName,
+				"partition", part.Partition,
+				"fetch_offset", part.FetchOffset,
+				"batch_bytes", len(batch),
+			)
+
+			topicResp.Partitions = append(topicResp.Partitions, partResp)
+		}
+		resp.Topics = append(resp.Topics, topicResp)
+	}
+
+	enc := protocol.NewEncoder()
+	enc.EncodeFetchResponse(header.CorrelationID, resp)
+	if _, err := conn.Write(enc.FullMessage()); err != nil {
+		return fmt.Errorf("handleFetch: write response: %w", err)
 	}
 	return nil
 }

@@ -14,6 +14,12 @@ func NewDecoder(r io.Reader) *Decoder {
 	return &Decoder{reader: r}
 }
 
+func (d *Decoder) ReadInt8() (int8, error) {
+	var value int8
+	err := binary.Read(d.reader, binary.BigEndian, &value)
+	return value, err
+}
+
 func (d *Decoder) ReadInt16() (int16, error) {
 	var value int16
 	err := binary.Read(d.reader, binary.BigEndian, &value)
