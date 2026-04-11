@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 const (
@@ -62,11 +63,15 @@ type Segment struct {
 	maxSize    int64
 }
 
-// SegmentConfig holds optional parameters for OpenSegment.
+// SegmentConfig holds optional parameters for OpenSegment and PartitionStore.
 type SegmentConfig struct {
 	// MaxSize is the maximum number of bytes the segment file may grow to.
 	// Defaults to DefaultMaxSegmentSize when zero.
 	MaxSize int64
+
+	// Retention is how long closed segments are kept before the log cleaner
+	// deletes them.  Zero (the default) disables retention-based cleanup.
+	Retention time.Duration
 }
 
 // OpenSegment opens or creates a segment file in dir.

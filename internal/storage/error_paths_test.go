@@ -2,7 +2,10 @@ package storage
 
 import (
 	"bufio"
+	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"os"
 	"testing"
 )
@@ -160,7 +163,7 @@ func TestSegment_Flush_IndexError(t *testing.T) {
 func TestPartitionStore_Rollover_OpenError(t *testing.T) {
 	dir := tempDir(t)
 	// maxSize = 9 so one 5-byte payload fills it (4+5 = 9).
-	ps, err := OpenPartitionStore(dir, SegmentConfig{MaxSize: 9})
+	ps, err := OpenPartitionStore(context.Background(), dir, SegmentConfig{MaxSize: 9}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("OpenPartitionStore: %v", err)
 	}
@@ -188,7 +191,7 @@ func TestPartitionStore_Rollover_OpenError(t *testing.T) {
 // close error on the current segment.
 func TestPartitionStore_Rollover_CloseError(t *testing.T) {
 	dir := tempDir(t)
-	ps, err := OpenPartitionStore(dir, SegmentConfig{MaxSize: 9})
+	ps, err := OpenPartitionStore(context.Background(), dir, SegmentConfig{MaxSize: 9}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("OpenPartitionStore: %v", err)
 	}
@@ -221,7 +224,7 @@ func TestPartitionStore_Append_ErrAfterRollover(t *testing.T) {
 	// path in Append: if both the current and the fresh segment return full,
 	// the error is wrapped and returned.
 	// Here we use maxSize = 4 (header only, no payload fits).
-	ps, err := OpenPartitionStore(dir, SegmentConfig{MaxSize: 4})
+	ps, err := OpenPartitionStore(context.Background(), dir, SegmentConfig{MaxSize: 4}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("OpenPartitionStore: %v", err)
 	}

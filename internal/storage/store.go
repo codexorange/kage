@@ -1,9 +1,15 @@
 package storage
 
 import (
+	"context"
 	"fmt"
 	"io"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
+	"time"
 )
 
 // AppendStore is the interface the server layer uses to persist record batches.
@@ -43,23 +49,34 @@ type PartitionStore struct {
 	dir     string
 	cfg     SegmentConfig
 	active  *Segment
+	logger  *slog.Logger
 	// nextBase is the logical offset for the next segment, set to the byte
 	// size of the current segment when it rolls over.
 	nextBase uint64
 }
 
+// cleanerInterval is how often the log cleaner wakes to scan for expired segments.
+const cleanerInterval = time.Minute
+
 // OpenPartitionStore opens (or creates) a PartitionStore rooted at dir.
 // It always starts with base offset 0 on the first segment.
-func OpenPartitionStore(dir string, cfg SegmentConfig) (*PartitionStore, error) {
+// If cfg.Retention > 0, a background log-cleaner goroutine is started; it
+// stops when ctx is cancelled.
+func OpenPartitionStore(ctx context.Context, dir string, cfg SegmentConfig, logger *slog.Logger) (*PartitionStore, error) {
 	seg, err := OpenSegment(dir, 0, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("storage: open partition store: %w", err)
 	}
-	return &PartitionStore{
+	ps := &PartitionStore{
 		dir:    dir,
 		cfg:    cfg,
 		active: seg,
-	}, nil
+		logger: logger,
+	}
+	if cfg.Retention > 0 {
+		go ps.startCleaner(ctx)
+	}
+	return ps, nil
 }
 
 // Append writes data to the active segment, rolling over to a new segment
@@ -144,4 +161,87 @@ func (ps *PartitionStore) Close() error {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 	return ps.active.Close()
+}
+
+// startCleaner runs a periodic log-retention sweep in a background goroutine.
+// It deletes closed segment files (.log and .index) whose last-modification
+// time is older than cfg.Retention. The active segment is never deleted.
+// The goroutine exits when ctx is cancelled.
+func (ps *PartitionStore) startCleaner(ctx context.Context) {
+	ticker := time.NewTicker(cleanerInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			ps.clean()
+		}
+	}
+}
+
+// clean performs one retention sweep. It is safe to call concurrently with
+// Append and Read because it only reads ps.active.BaseOffset() under no lock
+// (BaseOffset is immutable after open) and uses the filesystem as its source
+// of truth for closed segments.
+func (ps *PartitionStore) clean() {
+	// Snapshot the active segment's base offset so we never delete it.
+	ps.mu.Lock()
+	activeBase := ps.active.BaseOffset()
+	ps.mu.Unlock()
+
+	activeLogName := fmt.Sprintf("%020d.log", activeBase)
+	cutoff := time.Now().Add(-ps.cfg.Retention)
+
+	entries, err := os.ReadDir(ps.dir)
+	if err != nil {
+		ps.logger.Error("log cleaner: failed to read directory",
+			"dir", ps.dir,
+			"error", err,
+		)
+		return
+	}
+
+	for _, e := range entries {
+		name := e.Name()
+
+		// Only consider closed .log segments; skip the active one.
+		if !strings.HasSuffix(name, ".log") || name == activeLogName {
+			continue
+		}
+
+		info, err := e.Info()
+		if err != nil {
+			ps.logger.Warn("log cleaner: stat failed", "file", name, "error", err)
+			continue
+		}
+
+		if info.ModTime().After(cutoff) {
+			continue // not yet expired
+		}
+
+		// Delete the .log file.
+		logPath := filepath.Join(ps.dir, name)
+		if err := os.Remove(logPath); err != nil && !os.IsNotExist(err) {
+			ps.logger.Error("log cleaner: failed to remove log segment",
+				"path", logPath,
+				"error", err,
+			)
+			continue
+		}
+		ps.logger.Info("log cleaner: removed expired segment", "path", logPath)
+
+		// Delete the paired .index file (same stem, different extension).
+		stem := strings.TrimSuffix(name, ".log")
+		idxPath := filepath.Join(ps.dir, stem+".index")
+		if err := os.Remove(idxPath); err != nil && !os.IsNotExist(err) {
+			ps.logger.Error("log cleaner: failed to remove index file",
+				"path", idxPath,
+				"error", err,
+			)
+			continue
+		}
+		ps.logger.Info("log cleaner: removed expired index", "path", idxPath)
+	}
 }
