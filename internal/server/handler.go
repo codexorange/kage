@@ -6,19 +6,22 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"time"
 
+	"github.com/codexorange/kage/internal/metrics"
 	"github.com/codexorange/kage/internal/protocol"
 	"github.com/codexorange/kage/internal/storage"
 )
 
 // Handler routes incoming Kafka requests to the appropriate response builder.
 type Handler struct {
-	logger *slog.Logger
-	store  storage.Store
+	logger  *slog.Logger
+	store   storage.Store
+	metrics *metrics.Metrics
 }
 
-func NewHandler(logger *slog.Logger, store storage.Store) *Handler {
-	return &Handler{logger: logger, store: store}
+func NewHandler(logger *slog.Logger, store storage.Store, m *metrics.Metrics) *Handler {
+	return &Handler{logger: logger, store: store, metrics: m}
 }
 
 // Handle reads requests from conn in a loop, dispatching each by ApiKey, until
@@ -98,7 +101,10 @@ func (h *Handler) handleProduce(conn net.Conn, dec *protocol.Decoder, header *pr
 				Partition: part.Partition,
 			}
 
+			start := time.Now()
 			offset, err := h.store.Append(part.RecordBatch)
+			h.metrics.ObserveDiskWrite(topic.TopicName, start)
+
 			if err != nil {
 				h.logger.Error("produce: storage append failed",
 					"topic", topic.TopicName,
@@ -110,6 +116,7 @@ func (h *Handler) handleProduce(conn net.Conn, dec *protocol.Decoder, header *pr
 			} else {
 				partResp.ErrorCode = 0
 				partResp.BaseOffset = int64(offset)
+				h.metrics.MessagesProducedTotal.WithLabelValues(topic.TopicName).Inc()
 				h.logger.Info("produce: batch stored",
 					"topic", topic.TopicName,
 					"partition", part.Partition,
@@ -148,10 +155,8 @@ func (h *Handler) handleFetch(conn net.Conn, dec *protocol.Decoder, header *prot
 		return fmt.Errorf("handleFetch: parse: %w", err)
 	}
 
-	// Global bytes budget across all partitions in this request.
 	remaining := req.MaxBytes
-
-	hwm := h.store.Size() // high-watermark: total bytes written
+	hwm := h.store.Size()
 
 	resp := &protocol.FetchResponse{
 		Topics: make([]protocol.FetchTopicResponse, 0, len(req.Topics)),
@@ -169,15 +174,12 @@ func (h *Handler) handleFetch(conn net.Conn, dec *protocol.Decoder, header *prot
 				HighWatermark: hwm,
 			}
 
-			// Effective cap: the smaller of the per-partition limit and what's
-			// left of the global budget.
 			cap := part.PartitionMaxBytes
 			if remaining < cap {
 				cap = remaining
 			}
 
 			if cap <= 0 {
-				// Global budget exhausted — return empty records for remaining partitions.
 				partResp.ErrorCode = protocol.ErrCodeNone
 				topicResp.Partitions = append(topicResp.Partitions, partResp)
 				continue
@@ -213,6 +215,7 @@ func (h *Handler) handleFetch(conn net.Conn, dec *protocol.Decoder, header *prot
 			partResp.RecordBatch = batch
 			remaining -= int32(len(batch))
 
+			h.metrics.MessagesFetchedTotal.WithLabelValues(topic.TopicName).Inc()
 			h.logger.Info("fetch: batch served",
 				"topic", topic.TopicName,
 				"partition", part.Partition,

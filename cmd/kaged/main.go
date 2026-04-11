@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/codexorange/kage/internal/config"
+	"github.com/codexorange/kage/internal/metrics"
 	"github.com/codexorange/kage/internal/server"
 	"github.com/codexorange/kage/internal/storage"
 )
@@ -38,6 +39,11 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Start Prometheus metrics server on brokerPort+1.
+	m := metrics.New()
+	metricsAddr := metrics.MetricsAddr(cfg.Port)
+	go m.ServeHTTP(ctx, metricsAddr, logger)
+
 	if err := os.MkdirAll(cfg.LogDirectory, 0o755); err != nil {
 		logger.Error("failed to create log directory", "path", cfg.LogDirectory, "error", err)
 		os.Exit(1)
@@ -61,12 +67,13 @@ func main() {
 
 	logger.Info("Kage broker started",
 		"address", cfg.Addr(),
+		"metrics_address", metricsAddr,
 		"log_directory", cfg.LogDirectory,
 		"pid", os.Getpid(),
 		"worker_pool_size", cfg.WorkerPoolSize,
 	)
 
-	handler := server.NewHandler(logger, store)
+	handler := server.NewHandler(logger, store, m)
 
 	sem := make(chan struct{}, cfg.WorkerPoolSize)
 	var wg sync.WaitGroup

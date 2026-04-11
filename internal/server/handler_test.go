@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/codexorange/kage/internal/metrics"
 	"github.com/codexorange/kage/internal/protocol"
 	"github.com/codexorange/kage/internal/storage"
 )
@@ -51,10 +52,10 @@ func (m *mockStore) Size() int64 {
 	return m.totalSize
 }
 
-// newTestHandler returns a Handler with a mock store and a silent logger.
+// newTestHandler returns a Handler with a mock store, silent logger, and real metrics.
 func newTestHandler(store *mockStore) *Handler {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return NewHandler(logger, store)
+	return NewHandler(logger, store, metrics.New())
 }
 
 // buildFrame wraps a body in a 4-byte size-prefixed frame (the Kafka wire framing).
