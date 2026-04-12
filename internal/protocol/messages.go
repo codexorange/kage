@@ -410,10 +410,11 @@ func (d *Decoder) ParseFetchRequest(header *RequestHeader) (*FetchRequest, error
 // FetchResponse (ApiKey 1, v4)
 // ──────────────────────────────────────────────────────────────────────────────
 
-// Kafka error codes used in FetchResponse.
+// Kafka error codes used in responses.
 const (
 	ErrCodeNone             int16 = 0
 	ErrCodeOffsetOutOfRange int16 = 1
+	ErrCodeCorruptMessage   int16 = 2
 )
 
 // FetchPartitionResponse holds the result for one fetched partition.

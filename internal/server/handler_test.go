@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"hash/crc32"
 	"io"
 	"log/slog"
 	"net"
@@ -85,7 +86,38 @@ func buildMetadataRequestFrame(correlationID int32, clientID string, topics []st
 	return buildFrame(body.Bytes())
 }
 
+// buildValidRecordBatch wraps payload bytes inside a valid Kafka RecordBatch v2
+// frame (magic=2, CRC32C correct, RecordsCount=1).  All tests that go through
+// handleProduce must use this so that ValidateRecordBatch passes.
+func buildValidRecordBatch(payload []byte) []byte {
+	// CRC body: fixed header fields (40 bytes) + payload as the single record.
+	var fixedFields [40]byte
+	binary.BigEndian.PutUint16(fixedFields[0:], 0)  // Attributes
+	binary.BigEndian.PutUint32(fixedFields[2:], 0)  // LastOffsetDelta (0 = 1 record)
+	binary.BigEndian.PutUint64(fixedFields[6:], 0)  // FirstTimestamp
+	binary.BigEndian.PutUint64(fixedFields[14:], 0) // MaxTimestamp
+	binary.BigEndian.PutUint64(fixedFields[22:], 0) // ProducerId
+	binary.BigEndian.PutUint16(fixedFields[30:], 0) // ProducerEpoch
+	binary.BigEndian.PutUint32(fixedFields[32:], 0) // BaseSequence
+	binary.BigEndian.PutUint32(fixedFields[36:], 1) // RecordsCount = 1
+
+	crcInput := append(fixedFields[:], payload...)
+	checksum := crc32.Checksum(crcInput, crc32.MakeTable(crc32.Castagnoli))
+
+	// length = PartitionLeaderEpoch(4) + Magic(1) + CRC(4) + len(crcInput)
+	length := 4 + 1 + 4 + len(crcInput)
+	buf := make([]byte, 12+length)
+	binary.BigEndian.PutUint64(buf[0:], 0)              // BaseOffset
+	binary.BigEndian.PutUint32(buf[8:], uint32(length)) // Length
+	binary.BigEndian.PutUint32(buf[12:], 0)             // PartitionLeaderEpoch
+	buf[16] = 2                                          // MagicByte
+	binary.BigEndian.PutUint32(buf[17:], checksum)      // CRC
+	copy(buf[21:], crcInput)
+	return buf
+}
+
 // buildProduceRequestFrame builds a complete ProduceRequest frame.
+// Each partition's RecordBatch is wrapped in a valid RecordBatch v2 envelope.
 func buildProduceRequestFrame(correlationID int32, clientID string, acks int16, topics []protocol.ProduceTopicData) []byte {
 	var body bytes.Buffer
 	body.Write(buildRequestHeader(protocol.ApiKeyProduce, 3, correlationID, clientID))
@@ -101,9 +133,10 @@ func buildProduceRequestFrame(correlationID int32, clientID string, acks int16, 
 		body.WriteString(t.TopicName)
 		binary.Write(&body, binary.BigEndian, int32(len(t.Partitions)))
 		for _, p := range t.Partitions {
+			batch := buildValidRecordBatch(p.RecordBatch)
 			binary.Write(&body, binary.BigEndian, p.Partition)
-			binary.Write(&body, binary.BigEndian, int32(len(p.RecordBatch)))
-			body.Write(p.RecordBatch)
+			binary.Write(&body, binary.BigEndian, int32(len(batch)))
+			body.Write(batch)
 		}
 	}
 	return buildFrame(body.Bytes())
@@ -582,8 +615,11 @@ func TestHandler_FetchRequest_HighWatermark(t *testing.T) {
 	payload := []byte("data")
 	parts := produceAndFetch(t, clientConn, "t", payload, 1024)
 
+	// HWM = segment recordHeaderSize(4) + RecordBatch envelope size.
+	// Envelope = BaseOffset(8)+Length(4)+PLEpoch(4)+Magic(1)+CRC(4)+fixedFields(40)+payload
+	envelopeSize := int64(8 + 4 + 4 + 1 + 4 + 40 + len(payload))
+	expectedHWM := int64(4) + envelopeSize // 4-byte segment record header
 	hwm := parts[0].highWatermark
-	expectedHWM := int64(4 + len(payload)) // recordHeaderSize + payload
 	if hwm != expectedHWM {
 		t.Errorf("high watermark = %d, want %d", hwm, expectedHWM)
 	}

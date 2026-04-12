@@ -122,6 +122,25 @@ func (h *Handler) handleProduce(conn net.Conn, dec *protocol.Decoder, header *pr
 				Partition: part.Partition,
 			}
 
+			// Validate RecordBatch integrity (magic byte + CRC32C).
+			// Skip validation for empty batches (no records to validate).
+			var recordCount int32
+			if len(part.RecordBatch) > 0 {
+				rc, err := protocol.ValidateRecordBatch(part.RecordBatch)
+				if err != nil {
+					h.logger.Warn("produce: invalid record batch",
+						"topic", topic.TopicName,
+						"partition", part.Partition,
+						"error", err,
+					)
+					partResp.ErrorCode = protocol.ErrCodeCorruptMessage
+					partResp.BaseOffset = -1
+					topicResp.Partitions = append(topicResp.Partitions, partResp)
+					continue
+				}
+				recordCount = rc
+			}
+
 			ps, err := h.store.GetOrCreatePartition(topic.TopicName, part.Partition)
 			if err != nil {
 				h.logger.Error("produce: failed to get partition store",
@@ -150,12 +169,14 @@ func (h *Handler) handleProduce(conn net.Conn, dec *protocol.Decoder, header *pr
 			} else {
 				partResp.ErrorCode = 0
 				partResp.BaseOffset = int64(offset)
-				h.metrics.MessagesProducedTotal.WithLabelValues(topic.TopicName).Inc()
+				// Count individual records, not batches.
+				h.metrics.MessagesProducedTotal.WithLabelValues(topic.TopicName).Add(float64(recordCount))
 				h.logger.Info("produce: batch stored",
 					"topic", topic.TopicName,
 					"partition", part.Partition,
 					"offset", offset,
 					"batch_bytes", len(part.RecordBatch),
+					"record_count", recordCount,
 				)
 			}
 			topicResp.Partitions = append(topicResp.Partitions, partResp)
