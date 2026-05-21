@@ -7,11 +7,11 @@ import (
 
 // API keys
 const (
-	ApiKeyProduce       int16 = 0
-	ApiKeyFetch         int16 = 1
-	ApiKeyMetadata      int16 = 3
-	ApiKeyOffsetCommit  int16 = 8
-	ApiKeyOffsetFetch   int16 = 9
+	ApiKeyProduce      int16 = 0
+	ApiKeyFetch        int16 = 1
+	ApiKeyMetadata     int16 = 3
+	ApiKeyOffsetCommit int16 = 8
+	ApiKeyOffsetFetch  int16 = 9
 )
 
 // ConsumerOffsetsTopic is the internal topic used to persist consumer group offsets.
@@ -248,9 +248,9 @@ func (d *Decoder) ParseProduceRequest(header *RequestHeader) (*ProduceRequest, e
 
 // ProducePartitionResponse carries the result for a single partition write.
 type ProducePartitionResponse struct {
-	BaseOffset int64  // 8 bytes — byte offset returned by storage.Segment.Append
-	Partition  int32  // 4 bytes
-	ErrorCode  int16  // 2 bytes
+	BaseOffset int64 // 8 bytes — byte offset returned by storage.Segment.Append
+	Partition  int32 // 4 bytes
+	ErrorCode  int16 // 2 bytes
 }
 
 // ProduceTopicResponse groups partition results under a topic name.

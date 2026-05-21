@@ -80,7 +80,7 @@ func TestPartitionStore_Rollover(t *testing.T) {
 	}
 	defer ps.Close()
 
-	payload := []byte("exactly16bytes!!")  // 16 bytes → record = 20 bytes
+	payload := []byte("exactly16bytes!!") // 16 bytes → record = 20 bytes
 	off1, err := ps.Append(payload)
 	if err != nil {
 		t.Fatalf("first Append: %v", err)

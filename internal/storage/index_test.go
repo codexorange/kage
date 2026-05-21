@@ -199,13 +199,13 @@ func TestIndex_Lookup_MultipleEntries(t *testing.T) {
 	}
 
 	cases := []struct {
-		target   uint64
-		wantPos  uint32
+		target  uint64
+		wantPos uint32
 	}{
 		{0, 0},
-		{50, 0},        // between 0 and 100 → floor is 0
+		{50, 0}, // between 0 and 100 → floor is 0
 		{100, 4096},
-		{199, 4096},    // between 100 and 200 → floor is 100
+		{199, 4096}, // between 100 and 200 → floor is 100
 		{900, 9 * IndexIntervalBytes},
 		{1000, 9 * IndexIntervalBytes}, // beyond last
 	}

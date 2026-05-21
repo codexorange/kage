@@ -67,9 +67,9 @@ func TestAppend_OffsetAdvancesByRecordSize(t *testing.T) {
 	seg := openDefault(t, dir, 0)
 
 	payloads := [][]byte{
-		[]byte("hello"),        // 5 bytes → record = 9
-		[]byte("world!!"),      // 7 bytes → record = 11
-		[]byte("kage-events"),  // 11 bytes → record = 15
+		[]byte("hello"),       // 5 bytes → record = 9
+		[]byte("world!!"),     // 7 bytes → record = 11
+		[]byte("kage-events"), // 11 bytes → record = 15
 	}
 
 	expected := uint64(0)

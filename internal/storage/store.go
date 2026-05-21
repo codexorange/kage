@@ -45,11 +45,11 @@ type Store interface {
 //
 // PartitionStore is safe for concurrent use.
 type PartitionStore struct {
-	mu      sync.Mutex
-	dir     string
-	cfg     SegmentConfig
-	active  *Segment
-	logger  *slog.Logger
+	mu     sync.Mutex
+	dir    string
+	cfg    SegmentConfig
+	active *Segment
+	logger *slog.Logger
 	// nextBase is the logical offset for the next segment, set to the byte
 	// size of the current segment when it rolls over.
 	nextBase uint64
