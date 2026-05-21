@@ -20,15 +20,15 @@ import (
 //	RecordsCount(4) Records(recordCount bytes)
 func buildRecordBatch(recordCount int32) []byte {
 	// Build the CRC body first (everything from byte 21 onward).
-	var crcBody [40]byte // fixed fields after the CRC
-	binary.BigEndian.PutUint16(crcBody[0:], 0)          // Attributes
+	var crcBody [40]byte                                           // fixed fields after the CRC
+	binary.BigEndian.PutUint16(crcBody[0:], 0)                     // Attributes
 	binary.BigEndian.PutUint32(crcBody[2:], uint32(recordCount-1)) // LastOffsetDelta
-	binary.BigEndian.PutUint64(crcBody[6:], 0)          // FirstTimestamp
-	binary.BigEndian.PutUint64(crcBody[14:], 0)         // MaxTimestamp
-	binary.BigEndian.PutUint64(crcBody[22:], 0)         // ProducerId
-	binary.BigEndian.PutUint16(crcBody[30:], 0)         // ProducerEpoch
-	binary.BigEndian.PutUint32(crcBody[32:], 0)         // BaseSequence
-	binary.BigEndian.PutUint32(crcBody[36:], uint32(recordCount)) // RecordsCount
+	binary.BigEndian.PutUint64(crcBody[6:], 0)                     // FirstTimestamp
+	binary.BigEndian.PutUint64(crcBody[14:], 0)                    // MaxTimestamp
+	binary.BigEndian.PutUint64(crcBody[22:], 0)                    // ProducerId
+	binary.BigEndian.PutUint16(crcBody[30:], 0)                    // ProducerEpoch
+	binary.BigEndian.PutUint32(crcBody[32:], 0)                    // BaseSequence
+	binary.BigEndian.PutUint32(crcBody[36:], uint32(recordCount))  // RecordsCount
 
 	// Records payload: just recordCount zero bytes as a stub.
 	records := make([]byte, recordCount)
@@ -40,11 +40,11 @@ func buildRecordBatch(recordCount int32) []byte {
 	length := 4 + 1 + 4 + len(crcInput)
 
 	buf := make([]byte, 12+length)
-	binary.BigEndian.PutUint64(buf[0:], 0)                   // BaseOffset
-	binary.BigEndian.PutUint32(buf[8:], uint32(length))      // Length
-	binary.BigEndian.PutUint32(buf[12:], 0)                  // PartitionLeaderEpoch
-	buf[16] = 2                                               // MagicByte
-	binary.BigEndian.PutUint32(buf[17:], checksum)           // CRC
+	binary.BigEndian.PutUint64(buf[0:], 0)              // BaseOffset
+	binary.BigEndian.PutUint32(buf[8:], uint32(length)) // Length
+	binary.BigEndian.PutUint32(buf[12:], 0)             // PartitionLeaderEpoch
+	buf[16] = 2                                         // MagicByte
+	binary.BigEndian.PutUint32(buf[17:], checksum)      // CRC
 	copy(buf[21:], crcInput)
 
 	return buf

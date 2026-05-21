@@ -17,9 +17,9 @@ func TestNewDecoder(t *testing.T) {
 
 func TestReadInt16(t *testing.T) {
 	tests := []struct {
-		name     string
-		value    int16
-		wantErr  bool
+		name    string
+		value   int16
+		wantErr bool
 	}{
 		{"positive", 1234, false},
 		{"zero", 0, false},

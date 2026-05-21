@@ -10,10 +10,10 @@ import (
 // (without the 4-byte size prefix).
 func buildFullRequestHeaderBytes(apiKey int16, corrID int32, clientID string) []byte {
 	var buf bytes.Buffer
-	binary.Write(&buf, binary.BigEndian, int32(0))          // size (placeholder)
-	binary.Write(&buf, binary.BigEndian, apiKey)            // ApiKey
-	binary.Write(&buf, binary.BigEndian, int16(0))          // ApiVersion
-	binary.Write(&buf, binary.BigEndian, corrID)            // CorrelationID
+	binary.Write(&buf, binary.BigEndian, int32(0)) // size (placeholder)
+	binary.Write(&buf, binary.BigEndian, apiKey)   // ApiKey
+	binary.Write(&buf, binary.BigEndian, int16(0)) // ApiVersion
+	binary.Write(&buf, binary.BigEndian, corrID)   // CorrelationID
 	binary.Write(&buf, binary.BigEndian, int16(len(clientID)))
 	buf.WriteString(clientID)
 	return buf.Bytes()
@@ -51,15 +51,15 @@ func TestParseMetadataRequest_TruncatedTopicName(t *testing.T) {
 func TestParseProduceRequest_TruncatedMidParse(t *testing.T) {
 	// Build a fully valid body and truncate at each field boundary.
 	var full bytes.Buffer
-	binary.Write(&full, binary.BigEndian, int16(-1))    // txnID: null
-	binary.Write(&full, binary.BigEndian, int16(1))     // acks
-	binary.Write(&full, binary.BigEndian, int32(5000))  // timeoutMs
-	binary.Write(&full, binary.BigEndian, int32(1))     // topic count
-	binary.Write(&full, binary.BigEndian, int16(5))     // topic name len
+	binary.Write(&full, binary.BigEndian, int16(-1))   // txnID: null
+	binary.Write(&full, binary.BigEndian, int16(1))    // acks
+	binary.Write(&full, binary.BigEndian, int32(5000)) // timeoutMs
+	binary.Write(&full, binary.BigEndian, int32(1))    // topic count
+	binary.Write(&full, binary.BigEndian, int16(5))    // topic name len
 	full.WriteString("topic")
-	binary.Write(&full, binary.BigEndian, int32(1))     // partition count
-	binary.Write(&full, binary.BigEndian, int32(0))     // partition index
-	binary.Write(&full, binary.BigEndian, int32(3))     // batch size
+	binary.Write(&full, binary.BigEndian, int32(1)) // partition count
+	binary.Write(&full, binary.BigEndian, int32(0)) // partition index
+	binary.Write(&full, binary.BigEndian, int32(3)) // batch size
 	full.WriteString("abc")
 
 	data := full.Bytes()
@@ -82,9 +82,9 @@ func TestParseProduceRequest_NegativeBatchSize(t *testing.T) {
 	binary.Write(&buf, binary.BigEndian, int32(1))    // topic count
 	binary.Write(&buf, binary.BigEndian, int16(1))    // topic name len
 	buf.WriteByte('t')
-	binary.Write(&buf, binary.BigEndian, int32(1))    // partition count
-	binary.Write(&buf, binary.BigEndian, int32(0))    // partition
-	binary.Write(&buf, binary.BigEndian, int32(-5))   // negative batch size
+	binary.Write(&buf, binary.BigEndian, int32(1))  // partition count
+	binary.Write(&buf, binary.BigEndian, int32(0))  // partition
+	binary.Write(&buf, binary.BigEndian, int32(-5)) // negative batch size
 
 	_, err := NewDecoder(&buf).ParseProduceRequest(&RequestHeader{})
 	if err == nil {
@@ -96,13 +96,13 @@ func TestParseProduceRequest_NegativeBatchSize(t *testing.T) {
 // boundary inside ParseFetchRequest.
 func TestParseFetchRequest_TruncatedMidParse(t *testing.T) {
 	var full bytes.Buffer
-	binary.Write(&full, binary.BigEndian, int32(-1))   // replicaID
-	binary.Write(&full, binary.BigEndian, int32(500))  // maxWaitMs
-	binary.Write(&full, binary.BigEndian, int32(1))    // minBytes
+	binary.Write(&full, binary.BigEndian, int32(-1))    // replicaID
+	binary.Write(&full, binary.BigEndian, int32(500))   // maxWaitMs
+	binary.Write(&full, binary.BigEndian, int32(1))     // minBytes
 	binary.Write(&full, binary.BigEndian, int32(1<<20)) // maxBytes
-	binary.Write(&full, binary.BigEndian, int8(0))     // isolationLevel
-	binary.Write(&full, binary.BigEndian, int32(1))    // topic count
-	binary.Write(&full, binary.BigEndian, int16(5))    // topic name len
+	binary.Write(&full, binary.BigEndian, int8(0))      // isolationLevel
+	binary.Write(&full, binary.BigEndian, int32(1))     // topic count
+	binary.Write(&full, binary.BigEndian, int16(5))     // topic name len
 	full.WriteString("topic")
 	binary.Write(&full, binary.BigEndian, int32(1))    // partition count
 	binary.Write(&full, binary.BigEndian, int32(0))    // partition

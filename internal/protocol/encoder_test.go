@@ -117,8 +117,8 @@ func TestBytes(t *testing.T) {
 func TestFullMessage(t *testing.T) {
 	t.Run("wraps payload with length prefix", func(t *testing.T) {
 		e := NewEncoder()
-		e.WriteInt32(42)    // 4 bytes
-		e.WriteInt16(7)     // 2 bytes — total payload = 6 bytes
+		e.WriteInt32(42) // 4 bytes
+		e.WriteInt16(7)  // 2 bytes — total payload = 6 bytes
 
 		full := e.FullMessage()
 		if len(full) != 10 { // 4 (size prefix) + 6 (payload)

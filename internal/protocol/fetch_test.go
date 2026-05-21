@@ -245,13 +245,13 @@ func TestEncodeFetchResponse_NullBatch(t *testing.T) {
 	raw := writeFetchResponseToBytes(t, 1, resp)
 
 	dec := NewDecoder(bytes.NewReader(raw))
-	dec.ReadInt32() // size
-	dec.ReadInt32() // corrID
-	dec.ReadInt32() // throttle
-	dec.ReadInt32() // topic count
+	dec.ReadInt32()  // size
+	dec.ReadInt32()  // corrID
+	dec.ReadInt32()  // throttle
+	dec.ReadInt32()  // topic count
 	dec.ReadString() // topic name
-	dec.ReadInt32() // partition count
-	dec.ReadInt32() // partition
+	dec.ReadInt32()  // partition count
+	dec.ReadInt32()  // partition
 	errCode, _ := dec.ReadInt16()
 	if errCode != ErrCodeOffsetOutOfRange {
 		t.Errorf("error code = %d, want %d", errCode, ErrCodeOffsetOutOfRange)
@@ -315,14 +315,14 @@ func TestEncodeFetchResponse_RoundTrip(t *testing.T) {
 	if int(frameSize) != len(raw)-4 {
 		t.Errorf("frame size = %d, want %d", frameSize, len(raw)-4)
 	}
-	dec.ReadInt32() // corrID
-	dec.ReadInt32() // throttle
-	dec.ReadInt32() // topic count
+	dec.ReadInt32()  // corrID
+	dec.ReadInt32()  // throttle
+	dec.ReadInt32()  // topic count
 	dec.ReadString() // topic name
-	dec.ReadInt32() // partition count
-	dec.ReadInt32() // partition
-	dec.ReadInt16() // error code
-	dec.ReadInt64() // high watermark
+	dec.ReadInt32()  // partition count
+	dec.ReadInt32()  // partition
+	dec.ReadInt16()  // error code
+	dec.ReadInt64()  // high watermark
 	sz, _ := dec.ReadInt32()
 	got, _ := dec.ReadBytes(int(sz))
 	if !bytes.Equal(got, batchData) {

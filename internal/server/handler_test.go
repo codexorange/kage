@@ -110,7 +110,7 @@ func buildValidRecordBatch(payload []byte) []byte {
 	binary.BigEndian.PutUint64(buf[0:], 0)              // BaseOffset
 	binary.BigEndian.PutUint32(buf[8:], uint32(length)) // Length
 	binary.BigEndian.PutUint32(buf[12:], 0)             // PartitionLeaderEpoch
-	buf[16] = 2                                          // MagicByte
+	buf[16] = 2                                         // MagicByte
 	binary.BigEndian.PutUint32(buf[17:], checksum)      // CRC
 	copy(buf[21:], crcInput)
 	return buf
@@ -371,8 +371,8 @@ func TestHandler_ProduceRequest_MultiplePartitions(t *testing.T) {
 
 	body := readResponse(t, clientConn)
 	dec := protocol.NewDecoder(bytes.NewReader(body))
-	dec.ReadInt32() // correlationID
-	dec.ReadInt32() // topic count
+	dec.ReadInt32()  // correlationID
+	dec.ReadInt32()  // topic count
 	dec.ReadString() // topic name
 
 	partCount, _ := dec.ReadInt32()
@@ -469,7 +469,7 @@ func buildFetchRequestFrame(correlationID int32, clientID string, maxBytes int32
 	binary.Write(&body, binary.BigEndian, int32(500)) // MaxWaitMs
 	binary.Write(&body, binary.BigEndian, int32(1))   // MinBytes
 	binary.Write(&body, binary.BigEndian, maxBytes)   // MaxBytes
-	body.WriteByte(0)                                  // IsolationLevel (int8)
+	body.WriteByte(0)                                 // IsolationLevel (int8)
 	binary.Write(&body, binary.BigEndian, int32(len(topics)))
 
 	for topicName, partitions := range topics {
@@ -901,11 +901,11 @@ func TestHandler_ProduceRequest_StorageError_ReportsErrorCode(t *testing.T) {
 
 	body := readResponse(t, clientConn)
 	dec := protocol.NewDecoder(bytes.NewReader(body))
-	dec.ReadInt32() // correlationID
-	dec.ReadInt32() // topic count
+	dec.ReadInt32()  // correlationID
+	dec.ReadInt32()  // topic count
 	dec.ReadString() // topic name
-	dec.ReadInt32() // partition count
-	dec.ReadInt32() // partition index
+	dec.ReadInt32()  // partition count
+	dec.ReadInt32()  // partition index
 
 	errCode, _ := dec.ReadInt16()
 	if errCode == 0 {
