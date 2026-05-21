@@ -158,18 +158,15 @@ func TestPartitionStore_ErrSegmentFull_Propagates(t *testing.T) {
 	}
 }
 
-// TestPartitionStore_Cleaner_DeletesExpiredSegments verifies that clean()
-// removes closed segments whose modification time is before the retention
-// cutoff, and leaves the active segment untouched.
+// TestPartitionStore_Cleaner_DeletesExpiredSegments verifies that
+// CleanOldSegments removes closed segments whose modification time is before
+// the retention cutoff, and leaves the active segment untouched.
 func TestPartitionStore_Cleaner_DeletesExpiredSegments(t *testing.T) {
 	dir := tempDir(t)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	// maxSize = 9 so one 5-byte payload fills one segment exactly (4+5 = 9).
-	ps, err := OpenPartitionStore(context.Background(), dir, SegmentConfig{
-		MaxSize:   9,
-		Retention: time.Hour, // large enough that no live segment is deleted
-	}, logger)
+	ps, err := OpenPartitionStore(context.Background(), dir, SegmentConfig{MaxSize: 9}, logger)
 	if err != nil {
 		t.Fatalf("OpenPartitionStore: %v", err)
 	}
@@ -184,7 +181,7 @@ func TestPartitionStore_Cleaner_DeletesExpiredSegments(t *testing.T) {
 		t.Fatalf("second Append: %v", err)
 	}
 
-	// Back-date the closed segment's .log file so it looks expired.
+	// Back-date the closed segment's .log and .index files so they look expired.
 	closedLog := dir + "/00000000000000000000.log"
 	closedIdx := dir + "/00000000000000000000.index"
 	ancient := time.Now().Add(-2 * time.Hour)
@@ -195,8 +192,13 @@ func TestPartitionStore_Cleaner_DeletesExpiredSegments(t *testing.T) {
 		t.Fatalf("chtimes index: %v", err)
 	}
 
-	// Run one cleaning cycle directly (without waiting for the ticker).
-	ps.clean()
+	n, err := ps.CleanOldSegments(time.Hour)
+	if err != nil {
+		t.Fatalf("CleanOldSegments: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("deleted count = %d, want 1", n)
+	}
 
 	// Closed segment files must be gone.
 	if _, err := os.Stat(closedLog); !os.IsNotExist(err) {
@@ -213,16 +215,13 @@ func TestPartitionStore_Cleaner_DeletesExpiredSegments(t *testing.T) {
 	}
 }
 
-// TestPartitionStore_Cleaner_KeepsNonExpiredSegments verifies that clean()
-// does not delete segments that are within the retention window.
+// TestPartitionStore_Cleaner_KeepsNonExpiredSegments verifies that
+// CleanOldSegments does not delete segments within the retention window.
 func TestPartitionStore_Cleaner_KeepsNonExpiredSegments(t *testing.T) {
 	dir := tempDir(t)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	ps, err := OpenPartitionStore(context.Background(), dir, SegmentConfig{
-		MaxSize:   9,
-		Retention: time.Hour,
-	}, logger)
+	ps, err := OpenPartitionStore(context.Background(), dir, SegmentConfig{MaxSize: 9}, logger)
 	if err != nil {
 		t.Fatalf("OpenPartitionStore: %v", err)
 	}
@@ -236,30 +235,16 @@ func TestPartitionStore_Cleaner_KeepsNonExpiredSegments(t *testing.T) {
 	}
 
 	// Do NOT back-date the closed segment — it is recent, within retention.
-	ps.clean()
+	n, err := ps.CleanOldSegments(time.Hour)
+	if err != nil {
+		t.Fatalf("CleanOldSegments: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("deleted count = %d, want 0 (segment is within retention)", n)
+	}
 
 	closedLog := dir + "/00000000000000000000.log"
 	if _, err := os.Stat(closedLog); err != nil {
 		t.Errorf("non-expired segment must not be deleted: %v", err)
 	}
-}
-
-// TestPartitionStore_Cleaner_StopsOnContextCancel verifies the cleaner
-// goroutine exits when the context is cancelled.
-func TestPartitionStore_Cleaner_StopsOnContextCancel(t *testing.T) {
-	dir := tempDir(t)
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-
-	ctx, cancel := context.WithCancel(context.Background())
-	ps, err := OpenPartitionStore(ctx, dir, SegmentConfig{
-		Retention: time.Millisecond, // short so cleaner starts immediately
-	}, logger)
-	if err != nil {
-		t.Fatalf("OpenPartitionStore: %v", err)
-	}
-	defer ps.Close()
-
-	// Cancel the context — the cleaner goroutine must exit without hanging.
-	cancel()
-	// No assertion needed beyond "no goroutine leak / no panic".
 }

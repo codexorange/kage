@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strconv"
 	"sync"
+	"time"
 )
 
 // partitionDirRe matches directories created by BrokerStore: "<topic>-<partition>".
@@ -86,6 +87,10 @@ func OpenBrokerStore(ctx context.Context, rootDir string, cfg SegmentConfig, log
 		logger.Info("broker store: loaded partition", "topic", topic, "partition", partition)
 	}
 
+	if cfg.Retention > 0 {
+		go bs.runLogCleaner(ctx)
+	}
+
 	return bs, nil
 }
 
@@ -144,6 +149,46 @@ func (bs *BrokerStore) Topics() []TopicPartition {
 		out = append(out, TopicPartition{Topic: m[1], Partition: int32(partNum)})
 	}
 	return out
+}
+
+// runLogCleaner runs a background goroutine that wakes every 5 minutes and
+// calls CleanOldSegments on every known partition. It exits when ctx is done.
+func (bs *BrokerStore) runLogCleaner(ctx context.Context) {
+	const cleanerInterval = 5 * time.Minute
+	ticker := time.NewTicker(cleanerInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			for _, tp := range bs.Topics() {
+				bs.mu.RLock()
+				ps, ok := bs.stores[partitionKey(tp.Topic, tp.Partition)]
+				bs.mu.RUnlock()
+				if !ok {
+					continue
+				}
+				n, err := ps.CleanOldSegments(bs.cfg.Retention)
+				if err != nil {
+					bs.logger.Error("log cleaner: partition sweep failed",
+						"topic", tp.Topic,
+						"partition", tp.Partition,
+						"error", err,
+					)
+					continue
+				}
+				if n > 0 {
+					bs.logger.Info("log cleaner: deleted expired segments",
+						"topic", tp.Topic,
+						"partition", tp.Partition,
+						"deleted", n,
+					)
+				}
+			}
+		}
+	}
 }
 
 // Close flushes and closes all managed PartitionStores.

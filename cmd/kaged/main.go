@@ -33,6 +33,7 @@ func main() {
 		"max_segment_size", cfg.MaxSegmentSize,
 		"worker_pool_size", cfg.WorkerPoolSize,
 		"shutdown_timeout", cfg.ShutdownTimeout,
+		"log_retention", cfg.LogRetention,
 	)
 
 	// Root context cancelled on SIGTERM/SIGINT.
@@ -50,7 +51,8 @@ func main() {
 	}
 
 	store, err := storage.OpenBrokerStore(ctx, cfg.LogDirectory, storage.SegmentConfig{
-		MaxSize: cfg.MaxSegmentSize,
+		MaxSize:   cfg.MaxSegmentSize,
+		Retention: cfg.LogRetention,
 	}, logger)
 	if err != nil {
 		logger.Error("failed to open broker store", "dir", cfg.LogDirectory, "error", err)

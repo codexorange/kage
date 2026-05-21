@@ -40,6 +40,10 @@ type Config struct {
 	// ShutdownTimeout is how long the broker waits for in-flight connections
 	// to drain before forcing exit (default 10s).
 	ShutdownTimeout time.Duration
+
+	// LogRetention is how long closed log segments are kept before the
+	// background cleaner deletes them (default 168h = 7 days).
+	LogRetention time.Duration
 }
 
 // defaults returns a Config pre-filled with the built-in defaults.
@@ -50,6 +54,7 @@ func defaults() Config {
 		MaxSegmentSize:  1 << 30, // 1 GiB
 		WorkerPoolSize:  10_000,
 		ShutdownTimeout: 10 * time.Second,
+		LogRetention:    168 * time.Hour, // 7 days
 	}
 }
 
@@ -134,6 +139,7 @@ func applyEnv(cfg *Config) error {
 		"max_segment_size": os.Getenv("KAGE_MAX_SEGMENT_SIZE"),
 		"worker_pool_size": os.Getenv("KAGE_WORKER_POOL_SIZE"),
 		"shutdown_timeout": os.Getenv("KAGE_SHUTDOWN_TIMEOUT"),
+		"log_retention":    os.Getenv("KAGE_LOG_RETENTION"),
 	}
 	for key, val := range vars {
 		if val == "" {
@@ -188,6 +194,16 @@ func applyField(cfg *Config, key, val string) error {
 			return fmt.Errorf("shutdown_timeout must be non-negative")
 		}
 		cfg.ShutdownTimeout = d
+
+	case "log_retention":
+		d, err := time.ParseDuration(val)
+		if err != nil {
+			return fmt.Errorf("invalid duration %q: %w", val, err)
+		}
+		if d < 0 {
+			return fmt.Errorf("log_retention must be non-negative")
+		}
+		cfg.LogRetention = d
 
 	default:
 		// Unknown keys are silently ignored — forward-compatibility.
