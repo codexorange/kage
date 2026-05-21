@@ -1205,6 +1205,61 @@ func TestHandler_OffsetCommit_CorrelationID(t *testing.T) {
 	}
 }
 
+// TestHandler_LoadOffsetsCache_HydratesFromDisk commits an offset via the
+// handler, creates a new Handler backed by the same BrokerStore, calls
+// LoadOffsetsCache, and verifies the offset is served correctly by
+// handleOffsetFetch.
+func TestHandler_LoadOffsetsCache_HydratesFromDisk(t *testing.T) {
+	// First handler: commit an offset to disk.
+	bs := newTestBrokerStore(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	srv1, cli1 := net.Pipe()
+	h1 := NewHandler(logger, bs, metrics.New())
+	go h1.Handle(srv1)
+
+	cli1.Write(buildOffsetCommitFrame(1, "c", "my-group", "my-topic", 2, 77))
+	body := readResponse(t, cli1)
+	_, errCode := decodeOffsetCommitResponse(t, body)
+	if errCode != 0 {
+		t.Fatalf("commit error code = %d, want 0", errCode)
+	}
+	cli1.Close()
+
+	// Second handler: fresh in-memory state, same on-disk store.
+	h2 := NewHandler(logger, bs, metrics.New())
+	if err := h2.LoadOffsetsCache(context.Background()); err != nil {
+		t.Fatalf("LoadOffsetsCache: %v", err)
+	}
+
+	srv2, cli2 := net.Pipe()
+	go h2.Handle(srv2)
+	defer cli2.Close()
+
+	cli2.Write(buildOffsetFetchFrame(2, "c", "my-group", "my-topic", 2))
+	body = readResponse(t, cli2)
+
+	_, offset, fetchErr := decodeOffsetFetchResponse(t, body)
+	if fetchErr != 0 {
+		t.Fatalf("fetch error code = %d, want 0", fetchErr)
+	}
+	if offset != 77 {
+		t.Errorf("hydrated offset = %d, want 77", offset)
+	}
+}
+
+// TestHandler_LoadOffsetsCache_FreshBroker verifies that LoadOffsetsCache on a
+// store with no __consumer_offsets data returns nil without error.
+func TestHandler_LoadOffsetsCache_FreshBroker(t *testing.T) {
+	bs := newTestBrokerStore(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	h := NewHandler(logger, bs, metrics.New())
+
+	if err := h.LoadOffsetsCache(context.Background()); err != nil {
+		t.Fatalf("LoadOffsetsCache on fresh broker: %v", err)
+	}
+}
+
 // TestHandler_OffsetCommit_WritesToConsumerOffsetsTopic verifies that
 // __consumer_offsets exists in the BrokerStore after a commit.
 func TestHandler_OffsetCommit_WritesToConsumerOffsetsTopic(t *testing.T) {

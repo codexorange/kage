@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -494,6 +495,132 @@ func (h *Handler) handleOffsetFetch(conn net.Conn, dec *protocol.Decoder, header
 		return fmt.Errorf("handleOffsetFetch: write response: %w", err)
 	}
 	return nil
+}
+
+// LoadOffsetsCache reads all records from the __consumer_offsets partition 0
+// and populates the in-memory offsetCache. It must be called before accepting
+// TCP connections so that committed offsets survive broker restarts.
+func (h *Handler) LoadOffsetsCache(ctx context.Context) error {
+	ps, err := h.store.GetOrCreatePartition(protocol.ConsumerOffsetsTopic, 0)
+	if err != nil {
+		// If the partition cannot even be opened it's a real error.
+		return fmt.Errorf("LoadOffsetsCache: open partition: %w", err)
+	}
+
+	size := ps.Size()
+	if size == 0 {
+		h.logger.Info("offset hydration: no committed offsets found (fresh broker)")
+		return nil
+	}
+
+	// Read the entire partition in one shot (maxBytes = int32 max, capped by size).
+	maxBytes := int32(size)
+	if size > int64(^uint32(0)>>1) {
+		maxBytes = int32(^uint32(0) >> 1)
+	}
+
+	r, _, err := ps.Read(0, maxBytes)
+	if err != nil {
+		return fmt.Errorf("LoadOffsetsCache: read partition: %w", err)
+	}
+
+	loaded := 0
+	var lenBuf [4]byte
+	h.offsetMu.Lock()
+	defer h.offsetMu.Unlock()
+
+	for {
+		// Read the 4-byte record length prefix written by the segment layer.
+		if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				break
+			}
+			return fmt.Errorf("LoadOffsetsCache: read record length: %w", err)
+		}
+		recLen := binary.BigEndian.Uint32(lenBuf[:])
+
+		rec := make([]byte, recLen)
+		if _, err := io.ReadFull(r, rec); err != nil {
+			return fmt.Errorf("LoadOffsetsCache: read record body: %w", err)
+		}
+
+		cacheKey, offset, err := decodeOffsetRecord(rec)
+		if err != nil {
+			h.logger.Warn("LoadOffsetsCache: skipping malformed record", "error", err)
+			continue
+		}
+
+		h.offsetCache[cacheKey] = offset
+		loaded++
+	}
+
+	h.logger.Info("offset hydration: complete", "loaded_offsets", loaded)
+	return nil
+}
+
+// decodeOffsetRecord parses the opaque byte slice stored in __consumer_offsets.
+// Format: keyLen(4) + key + valueLen(4) + value
+// Key format: groupIDLen(2) + groupID + topicLen(2) + topic + partition(4)
+// Value: big-endian uint64 committed offset.
+func decodeOffsetRecord(record []byte) (offsetCacheKey, int64, error) {
+	if len(record) < 4 {
+		return offsetCacheKey{}, 0, fmt.Errorf("decodeOffsetRecord: record too short (%d bytes)", len(record))
+	}
+	pos := 0
+
+	keyLen := int(binary.BigEndian.Uint32(record[pos:]))
+	pos += 4
+	if pos+keyLen > len(record) {
+		return offsetCacheKey{}, 0, fmt.Errorf("decodeOffsetRecord: key length %d exceeds record", keyLen)
+	}
+	key := record[pos : pos+keyLen]
+	pos += keyLen
+
+	if pos+4 > len(record) {
+		return offsetCacheKey{}, 0, fmt.Errorf("decodeOffsetRecord: no room for value length")
+	}
+	valueLen := int(binary.BigEndian.Uint32(record[pos:]))
+	pos += 4
+	if pos+valueLen > len(record) {
+		return offsetCacheKey{}, 0, fmt.Errorf("decodeOffsetRecord: value length %d exceeds record", valueLen)
+	}
+	value := record[pos : pos+valueLen]
+
+	// Decode key: groupIDLen(2) + groupID + topicLen(2) + topic + partition(4)
+	kpos := 0
+	if len(key) < 2 {
+		return offsetCacheKey{}, 0, fmt.Errorf("decodeOffsetRecord: key too short for groupID length")
+	}
+	groupIDLen := int(binary.BigEndian.Uint16(key[kpos:]))
+	kpos += 2
+	if kpos+groupIDLen > len(key) {
+		return offsetCacheKey{}, 0, fmt.Errorf("decodeOffsetRecord: groupID length %d exceeds key", groupIDLen)
+	}
+	groupID := string(key[kpos : kpos+groupIDLen])
+	kpos += groupIDLen
+
+	if kpos+2 > len(key) {
+		return offsetCacheKey{}, 0, fmt.Errorf("decodeOffsetRecord: key too short for topic length")
+	}
+	topicLen := int(binary.BigEndian.Uint16(key[kpos:]))
+	kpos += 2
+	if kpos+topicLen > len(key) {
+		return offsetCacheKey{}, 0, fmt.Errorf("decodeOffsetRecord: topic length %d exceeds key", topicLen)
+	}
+	topic := string(key[kpos : kpos+topicLen])
+	kpos += topicLen
+
+	if kpos+4 > len(key) {
+		return offsetCacheKey{}, 0, fmt.Errorf("decodeOffsetRecord: key too short for partition")
+	}
+	partition := int32(binary.BigEndian.Uint32(key[kpos:]))
+
+	if len(value) < 8 {
+		return offsetCacheKey{}, 0, fmt.Errorf("decodeOffsetRecord: value too short for offset (%d bytes)", len(value))
+	}
+	offset := int64(binary.BigEndian.Uint64(value[:8]))
+
+	return offsetCacheKey{GroupID: groupID, Topic: topic, Partition: partition}, offset, nil
 }
 
 // encodeOffsetKey serialises a (groupID, topic, partition) tuple into a byte

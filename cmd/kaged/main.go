@@ -75,6 +75,11 @@ func main() {
 
 	handler := server.NewHandler(logger, store, m)
 
+	if err := handler.LoadOffsetsCache(ctx); err != nil {
+		logger.Error("failed to hydrate offset cache", "error", err)
+		os.Exit(1)
+	}
+
 	sem := make(chan struct{}, cfg.WorkerPoolSize)
 	var wg sync.WaitGroup
 
