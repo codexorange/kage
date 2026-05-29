@@ -1,0 +1,26 @@
+# Version control
+.git
+.gitignore
+
+# Editor / IDE artifacts
+.idea
+.vscode
+*.swp
+*.swo
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# Test artifacts and coverage reports
+**/*_test.go
+*.out
+*.test
+
+# Local data directories
+data/
+tmp/
+
+# Docker files (no need to copy into the image)
+Dockerfile
+.dockerignore

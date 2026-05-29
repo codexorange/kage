@@ -2,92 +2,137 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
-	"github.com/codexorange/kage/internal/protocol"
+	"github.com/codexorange/kage/internal/config"
+	"github.com/codexorange/kage/internal/metrics"
+	"github.com/codexorange/kage/internal/server"
+	"github.com/codexorange/kage/internal/storage"
 )
 
 func main() {
-	// 1. Inicializar Logger Estructurado
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(logger)
 
-	// 2. Configuración (Por ahora hardcoded, luego irá a internal/config)
-	addr := "0.0.0.0:9092"
-
-	// 3. Crear el listener TCP
-	lc := net.ListenConfig{}
-	listener, err := lc.Listen(context.Background(), "tcp", addr)
+	cfg, err := config.Load(config.DefaultConfigFile)
 	if err != nil {
-		logger.Error("No se pudo abrir el puerto", "error", err, "addr", addr)
+		logger.Error("failed to load configuration", "error", err)
 		os.Exit(1)
 	}
 
-	logger.Info("Kage Broker iniciado", "address", addr, "pid", os.Getpid())
+	logger.Info("configuration loaded",
+		"port", cfg.Port,
+		"log_directory", cfg.LogDirectory,
+		"max_segment_size", cfg.MaxSegmentSize,
+		"worker_pool_size", cfg.WorkerPoolSize,
+		"shutdown_timeout", cfg.ShutdownTimeout,
+		"log_retention", cfg.LogRetention,
+	)
 
-	// 4. Canal para manejar el apagado (Graceful Shutdown)
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	// Root context cancelled on SIGTERM/SIGINT.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-	// Canal para errores del servidor
-	serverError := make(chan error, 1)
+	// Start Prometheus metrics server on brokerPort+1.
+	m := metrics.New()
+	metricsAddr := metrics.MetricsAddr(cfg.Port)
+	go m.ServeHTTP(ctx, metricsAddr, logger)
 
-	// 5. Iniciar el loop de aceptación en una goroutine
+	if err := os.MkdirAll(cfg.LogDirectory, 0o755); err != nil {
+		logger.Error("failed to create log directory", "path", cfg.LogDirectory, "error", err)
+		os.Exit(1)
+	}
+
+	store, err := storage.OpenBrokerStore(ctx, cfg.LogDirectory, storage.SegmentConfig{
+		MaxSize:   cfg.MaxSegmentSize,
+		Retention: cfg.LogRetention,
+	}, logger)
+	if err != nil {
+		logger.Error("failed to open broker store", "dir", cfg.LogDirectory, "error", err)
+		os.Exit(1)
+	}
+	defer store.Close()
+
+	lc := net.ListenConfig{}
+	listener, err := lc.Listen(ctx, "tcp", cfg.Addr())
+	if err != nil {
+		logger.Error("failed to bind listener", "error", err, "addr", cfg.Addr())
+		os.Exit(1)
+	}
+
+	logger.Info("Kage broker started",
+		"address", cfg.Addr(),
+		"metrics_address", metricsAddr,
+		"log_directory", cfg.LogDirectory,
+		"pid", os.Getpid(),
+		"worker_pool_size", cfg.WorkerPoolSize,
+	)
+
+	handler := server.NewHandler(logger, store, m)
+
+	if err := handler.LoadOffsetsCache(ctx); err != nil {
+		logger.Error("failed to hydrate offset cache", "error", err)
+		os.Exit(1)
+	}
+
+	sem := make(chan struct{}, cfg.WorkerPoolSize)
+	var wg sync.WaitGroup
+
 	go func() {
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
-				serverError <- err
+				if errors.Is(err, net.ErrClosed) {
+					return
+				}
+				logger.Error("accept error", "error", err)
 				return
 			}
-			go handleConnection(conn, logger)
+
+			select {
+			case sem <- struct{}{}:
+			default:
+				logger.Warn("worker pool exhausted, rejecting connection",
+					"client", conn.RemoteAddr().String(),
+					"worker_pool_size", cfg.WorkerPoolSize,
+				)
+				conn.Close()
+				continue
+			}
+
+			wg.Add(1)
+			go func(c net.Conn) {
+				defer func() {
+					<-sem
+					wg.Done()
+				}()
+				handler.Handle(c)
+			}(conn)
 		}
 	}()
 
-	// 6. Esperar a una señal de stop o un error fatal
-	select {
-	case sig := <-stop:
-		logger.Info("Apagando Kage...", "signal", sig.String())
-	case err := <-serverError:
-		logger.Error("Error crítico en el servidor", "error", err)
-	}
-
-	// 7. Cierre limpio
-	// Damos un margen de tiempo para cerrar conexiones activas
-	_, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	<-ctx.Done()
+	logger.Info("shutdown signal received, closing listener")
 
 	listener.Close()
-	logger.Info("Kage se detuvo correctamente")
-}
 
-func handleConnection(conn net.Conn, logger *slog.Logger) {
-	defer conn.Close()
-	remoteAddr := conn.RemoteAddr().String()
-	logger.Debug("Nueva conexión establecida", "client", remoteAddr)
+	shutdownDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(shutdownDone)
+	}()
 
-	decoder := protocol.NewDecoder(conn)
-
-	// Intentamos leer la cabecera de la petición
-	header, err := decoder.ParseRequestHeader()
-	if err != nil {
-		if err != os.ErrClosed {
-			logger.Error("Error al parsear la cabecera", "client", remoteAddr, "error", err)
-		}
-		return
+	select {
+	case <-shutdownDone:
+		logger.Info("all connections drained, Kage stopped cleanly")
+	case <-time.After(cfg.ShutdownTimeout):
+		logger.Warn("shutdown timeout exceeded, forcing exit", "timeout", cfg.ShutdownTimeout)
 	}
-
-	logger.Info("Petición recibida",
-		"client", remoteAddr,
-		"api_key", header.ApiKey,
-		"version", header.ApiVersion,
-		"correlation_id", header.CorrelationID,
-	)
-
-	// TODO: Aquí llamaremos al Handler para generar la respuesta (Encoder)
 }

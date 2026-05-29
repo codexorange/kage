@@ -1,0 +1,61 @@
+name: Pull Request Pipeline
+
+# Trigger the workflow only on Pull Requests targeting 'develop' or 'master'
+on:
+  pull_request:
+    branches:
+      - develop
+      - master
+
+jobs:
+  lint:
+    name: Lint & Format Code
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Setup Go Environment
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Verify Code Formatting (gofmt)
+        run: |
+          if [ -n "$(gofmt -l .)" ]; then
+            echo "The following files are not properly formatted:"
+            gofmt -l .
+            echo "Please run 'go fmt ./...' locally and commit the changes."
+            exit 1
+          fi
+
+      - name: Run GolangCI-Lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          args: --timeout=5m --go=1.24
+
+  test:
+    name: Unit Tests & Race Detection
+    runs-on: ubuntu-latest
+    # Wait for linter to pass before running computationally expensive tests
+    needs: lint 
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Setup Go Environment
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Execute Unit Tests with Race Detector
+        # -v: verbose output
+        # -race: detects data races (CRITICAL for high-concurrency brokers)
+        # -coverprofile: outputs code coverage
+        run: go test -v -race -coverprofile=coverage.out ./...
+
+      - name: Display Coverage Report
+        run: go tool cover -func=coverage.out
