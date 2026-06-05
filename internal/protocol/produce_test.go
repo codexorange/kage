@@ -97,7 +97,6 @@ func TestParseProduceRequest_AcksAll(t *testing.T) {
 	}
 }
 
-
 func TestParseProduceRequest_MultipleTopicsAndPartitions(t *testing.T) {
 	topics := []ProduceTopicData{
 		{
