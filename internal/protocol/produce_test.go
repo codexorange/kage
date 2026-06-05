@@ -6,17 +6,11 @@ import (
 	"testing"
 )
 
-// buildProduceRequestBody encodes a ProduceRequest body (after the header).
-func buildProduceRequestBody(txnID string, acks int16, timeoutMs int32, topics []ProduceTopicData) []byte {
+// buildProduceRequestBody encodes a ProduceRequest v2 body (after the header).
+// v2 layout: Acks(int16) | TimeoutMs(int32) | topics[]
+// (No transactional_id — that field was introduced in v3.)
+func buildProduceRequestBody(acks int16, timeoutMs int32, topics []ProduceTopicData) []byte {
 	var buf bytes.Buffer
-
-	// TransactionalID: nullable string (int16 length, -1 = null)
-	if txnID == "" {
-		binary.Write(&buf, binary.BigEndian, int16(-1))
-	} else {
-		binary.Write(&buf, binary.BigEndian, int16(len(txnID)))
-		buf.WriteString(txnID)
-	}
 
 	binary.Write(&buf, binary.BigEndian, acks)
 	binary.Write(&buf, binary.BigEndian, timeoutMs)
@@ -46,7 +40,7 @@ func TestParseProduceRequest_SingleTopicPartition(t *testing.T) {
 			},
 		},
 	}
-	body := buildProduceRequestBody("", AcksLeader, 5000, topics)
+	body := buildProduceRequestBody(AcksLeader, 5000, topics)
 	hdr := &RequestHeader{ApiKey: ApiKeyProduce}
 
 	req, err := NewDecoder(bytes.NewReader(body)).ParseProduceRequest(hdr)
@@ -78,7 +72,7 @@ func TestParseProduceRequest_SingleTopicPartition(t *testing.T) {
 }
 
 func TestParseProduceRequest_AcksNone(t *testing.T) {
-	body := buildProduceRequestBody("", AcksNone, 1000, []ProduceTopicData{
+	body := buildProduceRequestBody(AcksNone, 1000, []ProduceTopicData{
 		{TopicName: "t", Partitions: []ProducePartitionData{{Partition: 0, RecordBatch: []byte("data")}}},
 	})
 	req, err := NewDecoder(bytes.NewReader(body)).ParseProduceRequest(&RequestHeader{})
@@ -91,7 +85,7 @@ func TestParseProduceRequest_AcksNone(t *testing.T) {
 }
 
 func TestParseProduceRequest_AcksAll(t *testing.T) {
-	body := buildProduceRequestBody("", AcksAll, 1000, []ProduceTopicData{
+	body := buildProduceRequestBody(AcksAll, 1000, []ProduceTopicData{
 		{TopicName: "t", Partitions: []ProducePartitionData{{Partition: 0, RecordBatch: []byte("x")}}},
 	})
 	req, err := NewDecoder(bytes.NewReader(body)).ParseProduceRequest(&RequestHeader{})
@@ -103,18 +97,6 @@ func TestParseProduceRequest_AcksAll(t *testing.T) {
 	}
 }
 
-func TestParseProduceRequest_WithTransactionalID(t *testing.T) {
-	body := buildProduceRequestBody("my-txn", AcksLeader, 3000, []ProduceTopicData{
-		{TopicName: "t", Partitions: []ProducePartitionData{{Partition: 1, RecordBatch: []byte("payload")}}},
-	})
-	req, err := NewDecoder(bytes.NewReader(body)).ParseProduceRequest(&RequestHeader{})
-	if err != nil {
-		t.Fatalf("ParseProduceRequest: %v", err)
-	}
-	if req.TransactionalID != "my-txn" {
-		t.Errorf("TransactionalID = %q, want %q", req.TransactionalID, "my-txn")
-	}
-}
 
 func TestParseProduceRequest_MultipleTopicsAndPartitions(t *testing.T) {
 	topics := []ProduceTopicData{
@@ -132,7 +114,7 @@ func TestParseProduceRequest_MultipleTopicsAndPartitions(t *testing.T) {
 			},
 		},
 	}
-	body := buildProduceRequestBody("", AcksLeader, 5000, topics)
+	body := buildProduceRequestBody(AcksLeader, 5000, topics)
 	req, err := NewDecoder(bytes.NewReader(body)).ParseProduceRequest(&RequestHeader{})
 	if err != nil {
 		t.Fatalf("ParseProduceRequest: %v", err)
@@ -149,7 +131,7 @@ func TestParseProduceRequest_MultipleTopicsAndPartitions(t *testing.T) {
 }
 
 func TestParseProduceRequest_EmptyBatch(t *testing.T) {
-	body := buildProduceRequestBody("", AcksLeader, 1000, []ProduceTopicData{
+	body := buildProduceRequestBody(AcksLeader, 1000, []ProduceTopicData{
 		{TopicName: "t", Partitions: []ProducePartitionData{{Partition: 0, RecordBatch: []byte{}}}},
 	})
 	req, err := NewDecoder(bytes.NewReader(body)).ParseProduceRequest(&RequestHeader{})
