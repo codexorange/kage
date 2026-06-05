@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -54,7 +55,7 @@ func (h *Handler) Handle(conn net.Conn) {
 	for {
 		header, err := decoder.ParseRequestHeader()
 		if err != nil {
-			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+			if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, net.ErrClosed) {
 				h.logger.Error("failed to parse request header", "client", remote, "error", err)
 			}
 			return
@@ -359,9 +360,14 @@ func (h *Handler) handleMetadata(conn net.Conn, dec *protocol.Decoder, header *p
 		})
 	}
 
+	advertisedHost := os.Getenv("KAGE_ADVERTISED_HOST")
+	if advertisedHost == "" {
+		advertisedHost = "127.0.0.1"
+	}
+
 	resp := &protocol.MetadataResponse{
 		Brokers: []protocol.Broker{
-			{NodeID: 1, Host: "localhost", Port: 9092, Rack: nil},
+			{NodeID: 1, Host: advertisedHost, Port: 9092, Rack: nil},
 		},
 		ClusterID:    nil,
 		ControllerID: 1,
