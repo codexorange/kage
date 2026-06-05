@@ -215,10 +215,10 @@ func TestHandler_MetadataRequest_EmptyTopics(t *testing.T) {
 
 	body := readResponse(t, clientConn)
 	dec := protocol.NewDecoder(bytes.NewReader(body))
-	dec.ReadInt32() // corrID
-	dec.ReadInt32() // ThrottleTimeMs (v1+)
-	dec.ReadInt32() // broker count
-	dec.ReadInt32() // NodeID
+	dec.ReadInt32()  // corrID
+	dec.ReadInt32()  // ThrottleTimeMs (v1+)
+	dec.ReadInt32()  // broker count
+	dec.ReadInt32()  // NodeID
 	dec.ReadString() // host
 	dec.ReadInt32()  // port
 	dec.ReadInt16()  // Rack (nullable string, -1 = null)

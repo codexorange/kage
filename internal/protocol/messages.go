@@ -48,12 +48,12 @@ type MetadataRequest struct {
 
 // MetadataResponse (ApiKey 3)
 type PartitionMetadata struct {
-	Replicas       []int32 // 24 bytes
-	Isr            []int32 // 24 bytes
+	Replicas        []int32 // 24 bytes
+	Isr             []int32 // 24 bytes
 	OfflineReplicas []int32 // added in v5+
-	Partition      int32   // 4 bytes
-	Leader         int32   // 4 bytes
-	ErrorCode      int16   // 2 bytes
+	Partition       int32   // 4 bytes
+	Leader          int32   // 4 bytes
+	ErrorCode       int16   // 2 bytes
 }
 
 type TopicMetadata struct {
