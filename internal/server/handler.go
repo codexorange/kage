@@ -91,9 +91,26 @@ func (h *Handler) dispatch(conn net.Conn, dec *protocol.Decoder, header *protoco
 		return h.handleOffsetCommit(conn, dec, header)
 	case protocol.ApiKeyOffsetFetch:
 		return h.handleOffsetFetch(conn, dec, header)
+	case protocol.ApiKeyApiVersions:
+		return h.handleApiVersions(conn, header)
 	default:
 		return fmt.Errorf("unsupported api_key: %d", header.ApiKey)
 	}
+}
+
+// handleApiVersions processes an ApiVersions request (ApiKey 18).
+//
+// The request body carries no fields beyond the standard header, so no decoder
+// call is needed. We respond with the static capability table so that clients
+// (e.g. kafkajs) can negotiate the API versions they will use for subsequent
+// requests.
+func (h *Handler) handleApiVersions(conn net.Conn, header *protocol.RequestHeader) error {
+	enc := protocol.NewEncoder()
+	enc.EncodeApiVersionsResponse(header.CorrelationID)
+	if _, err := conn.Write(enc.FullMessage()); err != nil {
+		return fmt.Errorf("handleApiVersions: write response: %w", err)
+	}
+	return nil
 }
 
 // handleProduce processes a ProduceRequest (ApiKey 0).

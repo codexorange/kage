@@ -12,6 +12,7 @@ const (
 	ApiKeyMetadata     int16 = 3
 	ApiKeyOffsetCommit int16 = 8
 	ApiKeyOffsetFetch  int16 = 9
+	ApiKeyApiVersions  int16 = 18
 )
 
 // ConsumerOffsetsTopic is the internal topic used to persist consumer group offsets.
@@ -774,6 +775,48 @@ func (e *Encoder) EncodeOffsetFetchResponse(correlationID int32, resp *OffsetFet
 			e.WriteInt16(p.ErrorCode)
 		}
 	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// ApiVersionsResponse (ApiKey 18, v0)
+// ──────────────────────────────────────────────────────────────────────────────
+
+// apiVersion describes a single supported API key with its version range.
+type apiVersion struct {
+	Key        int16
+	MinVersion int16
+	MaxVersion int16
+}
+
+// supportedAPIVersions is the static capability table advertised to clients.
+var supportedAPIVersions = []apiVersion{
+	{Key: ApiKeyProduce, MinVersion: 0, MaxVersion: 7},
+	{Key: ApiKeyFetch, MinVersion: 0, MaxVersion: 11},
+	{Key: ApiKeyMetadata, MinVersion: 0, MaxVersion: 9},
+	{Key: ApiKeyApiVersions, MinVersion: 0, MaxVersion: 2},
+}
+
+// EncodeApiVersionsResponse serialises an ApiVersions response (v0) into the Encoder.
+//
+// Wire layout (after the 4-byte frame size prefix written by FullMessage):
+//
+//	CorrelationID  int32
+//	ErrorCode      int16
+//	api_versions[] int32 (array length)
+//	  ApiKey       int16
+//	  MinVersion   int16
+//	  MaxVersion   int16
+//	ThrottleTimeMs int32
+func (e *Encoder) EncodeApiVersionsResponse(correlationID int32) {
+	e.WriteInt32(correlationID)
+	e.WriteInt16(ErrCodeNone)
+	e.WriteInt32(int32(len(supportedAPIVersions)))
+	for _, v := range supportedAPIVersions {
+		e.WriteInt16(v.Key)
+		e.WriteInt16(v.MinVersion)
+		e.WriteInt16(v.MaxVersion)
+	}
+	e.WriteInt32(0) // ThrottleTimeMs
 }
 
 // EncodeMetadataResponse encodes a MetadataResponse into the Encoder.
