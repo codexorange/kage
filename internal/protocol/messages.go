@@ -149,9 +149,8 @@ type ProduceTopicData struct {
 	Partitions []ProducePartitionData
 }
 
-// ProduceRequest (v3) wire layout after the request header:
+// ProduceRequest (v2) wire layout after the request header:
 //
-//	TransactionalID  string (nullable: int16=-1 means null)
 //	Acks             int16
 //	TimeoutMs        int32
 //	topics[]
@@ -160,30 +159,18 @@ type ProduceTopicData struct {
 //	    Partition    int32
 //	    BatchSize    int32   (byte length of RecordBatch)
 //	    RecordBatch  []byte
+//
+// Note: v3+ adds TransactionalID (nullable string) before Acks. We advertise
+// MaxVersion=2 in ApiVersionsResponse so clients never send that field.
 type ProduceRequest struct {
-	Topics          []ProduceTopicData // 24 bytes
-	TransactionalID string             // 16 bytes — empty when null
-	Header          *RequestHeader     // 8 bytes
-	TimeoutMs       int32              // 4 bytes
-	Acks            int16              // 2 bytes
+	Topics    []ProduceTopicData // 24 bytes
+	Header    *RequestHeader     // 8 bytes
+	TimeoutMs int32              // 4 bytes
+	Acks      int16              // 2 bytes
 }
 
-// ParseProduceRequest reads the ProduceRequest body after the header.
+// ParseProduceRequest reads the ProduceRequest v2 body after the header.
 func (d *Decoder) ParseProduceRequest(header *RequestHeader) (*ProduceRequest, error) {
-	// TransactionalID is a nullable string: length int16, -1 means null/absent.
-	txnIDLen, err := d.ReadInt16()
-	if err != nil {
-		return nil, fmt.Errorf("produce request: read transactional_id length: %w", err)
-	}
-	var txnID string
-	if txnIDLen > 0 {
-		raw, err := d.ReadBytes(int(txnIDLen))
-		if err != nil {
-			return nil, fmt.Errorf("produce request: read transactional_id: %w", err)
-		}
-		txnID = string(raw)
-	}
-
 	acks, err := d.ReadInt16()
 	if err != nil {
 		return nil, fmt.Errorf("produce request: read acks: %w", err)
@@ -240,11 +227,10 @@ func (d *Decoder) ParseProduceRequest(header *RequestHeader) (*ProduceRequest, e
 	}
 
 	return &ProduceRequest{
-		Header:          header,
-		TransactionalID: txnID,
-		Acks:            acks,
-		TimeoutMs:       timeoutMs,
-		Topics:          topics,
+		Header:    header,
+		Acks:      acks,
+		TimeoutMs: timeoutMs,
+		Topics:    topics,
 	}, nil
 }
 
@@ -794,8 +780,12 @@ type apiVersion struct {
 }
 
 // supportedAPIVersions is the static capability table advertised to clients.
+// Produce is capped at v2 to match our ParseProduceRequest implementation,
+// which follows the v2 wire layout (no transactional_id field).
+// Advertising v3+ would cause kafkajs to prepend transactional_id, misaligning
+// the byte stream and corrupting subsequent reads.
 var supportedAPIVersions = []apiVersion{
-	{Key: ApiKeyProduce, MinVersion: 0, MaxVersion: 7},
+	{Key: ApiKeyProduce, MinVersion: 0, MaxVersion: 2},
 	{Key: ApiKeyFetch, MinVersion: 0, MaxVersion: 11},
 	{Key: ApiKeyMetadata, MinVersion: 0, MaxVersion: 9},
 	{Key: ApiKeyApiVersions, MinVersion: 0, MaxVersion: 2},

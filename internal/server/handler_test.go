@@ -116,14 +116,13 @@ func buildValidRecordBatch(payload []byte) []byte {
 	return buf
 }
 
-// buildProduceRequestFrame builds a complete ProduceRequest frame.
+// buildProduceRequestFrame builds a complete ProduceRequest v2 frame.
 // Each partition's RecordBatch is wrapped in a valid RecordBatch v2 envelope.
+// v2 layout: Acks(int16) | TimeoutMs(int32) | topics[] — no transactional_id.
 func buildProduceRequestFrame(correlationID int32, clientID string, acks int16, topics []protocol.ProduceTopicData) []byte {
 	var body bytes.Buffer
-	body.Write(buildRequestHeader(protocol.ApiKeyProduce, 3, correlationID, clientID))
+	body.Write(buildRequestHeader(protocol.ApiKeyProduce, 2, correlationID, clientID))
 
-	// TransactionalID: null (-1)
-	binary.Write(&body, binary.BigEndian, int16(-1))
 	binary.Write(&body, binary.BigEndian, acks)
 	binary.Write(&body, binary.BigEndian, int32(5000)) // timeoutMs
 	binary.Write(&body, binary.BigEndian, int32(len(topics)))
