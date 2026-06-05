@@ -182,13 +182,16 @@ func TestParseMetadataRequest_Truncated(t *testing.T) {
 
 func TestEncodeMetadataResponse(t *testing.T) {
 	resp := &MetadataResponse{
-		Brokers: []Broker{{NodeID: 1, Host: "localhost", Port: 9092}},
+		Brokers:      []Broker{{NodeID: 1, Host: "localhost", Port: 9092, Rack: nil}},
+		ClusterID:    nil,
+		ControllerID: 1,
 		Topics: []TopicMetadata{
 			{
-				ErrorCode: 0,
-				Name:      "kage-events",
+				ErrorCode:  0,
+				Name:       "kage-events",
+				IsInternal: false,
 				Partitions: []PartitionMetadata{
-					{ErrorCode: 0, Partition: 0, Leader: 1, Replicas: []int32{1}, Isr: []int32{1}},
+					{ErrorCode: 0, Partition: 0, Leader: 1, Replicas: []int32{1}, Isr: []int32{1}, OfflineReplicas: nil},
 				},
 			},
 		},
@@ -198,17 +201,20 @@ func TestEncodeMetadataResponse(t *testing.T) {
 	enc.EncodeMetadataResponse(42, resp)
 	raw := enc.FullMessage()
 
-	// Must be non-empty and start with a 4-byte size prefix > 0.
 	if len(raw) < 4 {
 		t.Fatalf("encoded response too short: %d bytes", len(raw))
 	}
 
-	// Decode and verify correlationID.
+	// Parse the v6 wire layout.
 	dec := NewDecoder(bytes.NewReader(raw))
+
+	// 4-byte size prefix.
 	size, _ := dec.ReadInt32()
 	if size <= 0 {
 		t.Fatalf("size prefix = %d, want > 0", size)
 	}
+
+	// CorrelationID.
 	corrID, err := dec.ReadInt32()
 	if err != nil {
 		t.Fatalf("failed to read correlationID: %v", err)
@@ -217,25 +223,45 @@ func TestEncodeMetadataResponse(t *testing.T) {
 		t.Errorf("correlationID = %d, want 42", corrID)
 	}
 
+	// ThrottleTimeMs (v1+).
+	throttle, _ := dec.ReadInt32()
+	if throttle != 0 {
+		t.Errorf("throttle_time_ms = %d, want 0", throttle)
+	}
+
 	// Broker count.
 	brokerCount, _ := dec.ReadInt32()
 	if brokerCount != 1 {
 		t.Errorf("broker count = %d, want 1", brokerCount)
 	}
-	// NodeID.
 	nodeID, _ := dec.ReadInt32()
 	if nodeID != 1 {
 		t.Errorf("broker NodeID = %d, want 1", nodeID)
 	}
-	// Host string.
 	host, _ := dec.ReadString()
 	if host != "localhost" {
 		t.Errorf("broker host = %q, want %q", host, "localhost")
 	}
-	// Port.
 	port, _ := dec.ReadInt32()
 	if port != 9092 {
 		t.Errorf("broker port = %d, want 9092", port)
+	}
+	// Rack: nullable string, -1 means null.
+	rackLen, _ := dec.ReadInt16()
+	if rackLen != -1 {
+		t.Errorf("broker rack length = %d, want -1 (null)", rackLen)
+	}
+
+	// ClusterID: nullable string (v2+), -1 means null.
+	clusterIDLen, _ := dec.ReadInt16()
+	if clusterIDLen != -1 {
+		t.Errorf("cluster_id length = %d, want -1 (null)", clusterIDLen)
+	}
+
+	// ControllerID (v1+).
+	controllerID, _ := dec.ReadInt32()
+	if controllerID != 1 {
+		t.Errorf("controller_id = %d, want 1", controllerID)
 	}
 
 	// Topic count.
@@ -243,19 +269,55 @@ func TestEncodeMetadataResponse(t *testing.T) {
 	if topicCount != 1 {
 		t.Errorf("topic count = %d, want 1", topicCount)
 	}
-	// Topic error code.
 	topicErr, _ := dec.ReadInt16()
 	if topicErr != 0 {
 		t.Errorf("topic error = %d, want 0", topicErr)
 	}
-	// Topic name.
 	topicName, _ := dec.ReadString()
 	if topicName != "kage-events" {
 		t.Errorf("topic name = %q, want %q", topicName, "kage-events")
+	}
+	// IsInternal (v1+): int8.
+	isInternal, _ := dec.ReadInt8()
+	if isInternal != 0 {
+		t.Errorf("is_internal = %d, want 0", isInternal)
 	}
 	// Partition count.
 	partCount, _ := dec.ReadInt32()
 	if partCount != 1 {
 		t.Errorf("partition count = %d, want 1", partCount)
+	}
+	// Partition fields.
+	partErr, _ := dec.ReadInt16()
+	if partErr != 0 {
+		t.Errorf("partition error = %d, want 0", partErr)
+	}
+	partIdx, _ := dec.ReadInt32()
+	if partIdx != 0 {
+		t.Errorf("partition index = %d, want 0", partIdx)
+	}
+	leaderID, _ := dec.ReadInt32()
+	if leaderID != 1 {
+		t.Errorf("leader_id = %d, want 1", leaderID)
+	}
+	replicaCount, _ := dec.ReadInt32()
+	if replicaCount != 1 {
+		t.Errorf("replica count = %d, want 1", replicaCount)
+	}
+	replicaNode, _ := dec.ReadInt32()
+	if replicaNode != 1 {
+		t.Errorf("replica node = %d, want 1", replicaNode)
+	}
+	isrCount, _ := dec.ReadInt32()
+	if isrCount != 1 {
+		t.Errorf("isr count = %d, want 1", isrCount)
+	}
+	isrNode, _ := dec.ReadInt32()
+	if isrNode != 1 {
+		t.Errorf("isr node = %d, want 1", isrNode)
+	}
+	offlineCount, _ := dec.ReadInt32()
+	if offlineCount != 0 {
+		t.Errorf("offline replicas count = %d, want 0", offlineCount)
 	}
 }

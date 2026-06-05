@@ -33,9 +33,23 @@ func (e *Encoder) WriteInt64(value int64) {
 	e.buffer.Write(buf[:])
 }
 
+func (e *Encoder) WriteInt8(value int8) {
+	e.buffer.WriteByte(byte(value))
+}
+
 func (e *Encoder) WriteString(value string) {
 	e.WriteInt16(int16(len(value)))
 	e.buffer.WriteString(value)
+}
+
+// WriteNullableString writes a nullable Kafka string.
+// A nil pointer writes int16(-1); a non-nil pointer writes the string normally.
+func (e *Encoder) WriteNullableString(value *string) {
+	if value == nil {
+		e.WriteInt16(-1)
+		return
+	}
+	e.WriteString(*value)
 }
 
 func (e *Encoder) WriteBytes(value []byte) {
