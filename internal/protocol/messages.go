@@ -7,12 +7,17 @@ import (
 
 // API keys
 const (
-	ApiKeyProduce      int16 = 0
-	ApiKeyFetch        int16 = 1
-	ApiKeyMetadata     int16 = 3
-	ApiKeyOffsetCommit int16 = 8
-	ApiKeyOffsetFetch  int16 = 9
-	ApiKeyApiVersions  int16 = 18
+	ApiKeyProduce         int16 = 0
+	ApiKeyFetch           int16 = 1
+	ApiKeyMetadata        int16 = 3
+	ApiKeyOffsetCommit    int16 = 8
+	ApiKeyOffsetFetch     int16 = 9
+	ApiKeyFindCoordinator int16 = 10
+	ApiKeyJoinGroup       int16 = 11
+	ApiKeyHeartbeat       int16 = 12
+	ApiKeyLeaveGroup      int16 = 13
+	ApiKeySyncGroup       int16 = 14
+	ApiKeyApiVersions     int16 = 18
 )
 
 // ConsumerOffsetsTopic is the internal topic used to persist consumer group offsets.
@@ -788,6 +793,13 @@ var supportedAPIVersions = []apiVersion{
 	{Key: ApiKeyProduce, MinVersion: 0, MaxVersion: 2},
 	{Key: ApiKeyFetch, MinVersion: 0, MaxVersion: 11},
 	{Key: ApiKeyMetadata, MinVersion: 0, MaxVersion: 9},
+	{Key: ApiKeyOffsetCommit, MinVersion: 0, MaxVersion: 2},
+	{Key: ApiKeyOffsetFetch, MinVersion: 0, MaxVersion: 1},
+	{Key: ApiKeyFindCoordinator, MinVersion: 0, MaxVersion: 0},
+	{Key: ApiKeyJoinGroup, MinVersion: 0, MaxVersion: 1},
+	{Key: ApiKeyHeartbeat, MinVersion: 0, MaxVersion: 0},
+	{Key: ApiKeyLeaveGroup, MinVersion: 0, MaxVersion: 0},
+	{Key: ApiKeySyncGroup, MinVersion: 0, MaxVersion: 0},
 	{Key: ApiKeyApiVersions, MinVersion: 0, MaxVersion: 2},
 }
 
@@ -812,6 +824,325 @@ func (e *Encoder) EncodeApiVersionsResponse(correlationID int32) {
 		e.WriteInt16(v.MaxVersion)
 	}
 	e.WriteInt32(0) // ThrottleTimeMs
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// FindCoordinator (ApiKey 10, v0)
+// ──────────────────────────────────────────────────────────────────────────────
+
+// FindCoordinatorRequest (v0) wire layout after the request header:
+//
+//	Key string  (group ID)
+type FindCoordinatorRequest struct {
+	Key string
+}
+
+// ParseFindCoordinatorRequest reads the FindCoordinator v0 body.
+func (d *Decoder) ParseFindCoordinatorRequest(header *RequestHeader) (*FindCoordinatorRequest, error) {
+	key, err := d.ReadString()
+	if err != nil {
+		return nil, fmt.Errorf("find coordinator: read key: %w", err)
+	}
+	return &FindCoordinatorRequest{Key: key}, nil
+}
+
+// EncodeFindCoordinatorResponse writes a FindCoordinator v0 response.
+//
+// Wire layout:
+//
+//	CorrelationID int32
+//	ErrorCode     int16
+//	NodeID        int32
+//	Host          string
+//	Port          int32
+func (e *Encoder) EncodeFindCoordinatorResponse(correlationID int32, nodeID int32, host string, port int32) {
+	e.WriteInt32(correlationID)
+	e.WriteInt16(ErrCodeNone)
+	e.WriteInt32(nodeID)
+	e.WriteString(host)
+	e.WriteInt32(port)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// JoinGroup (ApiKey 11, v1)
+// ──────────────────────────────────────────────────────────────────────────────
+
+// JoinGroupProtocol holds one protocol entry from a JoinGroup request.
+type JoinGroupProtocol struct {
+	Name     string
+	Metadata []byte
+}
+
+// JoinGroupRequest (v1) wire layout after the request header:
+//
+//	GroupID            string
+//	SessionTimeoutMs   int32
+//	RebalanceTimeoutMs int32
+//	MemberID           string
+//	ProtocolType       string
+//	protocols[]
+//	  Name             string
+//	  Metadata         bytes (int32 len prefix)
+type JoinGroupRequest struct {
+	Protocols          []JoinGroupProtocol
+	GroupID            string
+	MemberID           string
+	ProtocolType       string
+	SessionTimeoutMs   int32
+	RebalanceTimeoutMs int32
+}
+
+// ParseJoinGroupRequest reads the JoinGroup v1 body.
+func (d *Decoder) ParseJoinGroupRequest(header *RequestHeader) (*JoinGroupRequest, error) {
+	groupID, err := d.ReadString()
+	if err != nil {
+		return nil, fmt.Errorf("join group: read group_id: %w", err)
+	}
+	sessionTimeoutMs, err := d.ReadInt32()
+	if err != nil {
+		return nil, fmt.Errorf("join group: read session_timeout_ms: %w", err)
+	}
+	rebalanceTimeoutMs, err := d.ReadInt32()
+	if err != nil {
+		return nil, fmt.Errorf("join group: read rebalance_timeout_ms: %w", err)
+	}
+	memberID, err := d.ReadString()
+	if err != nil {
+		return nil, fmt.Errorf("join group: read member_id: %w", err)
+	}
+	protocolType, err := d.ReadString()
+	if err != nil {
+		return nil, fmt.Errorf("join group: read protocol_type: %w", err)
+	}
+	protoCount, err := d.ReadInt32()
+	if err != nil {
+		return nil, fmt.Errorf("join group: read protocol count: %w", err)
+	}
+	protocols := make([]JoinGroupProtocol, 0, protoCount)
+	for i := int32(0); i < protoCount; i++ {
+		name, err := d.ReadString()
+		if err != nil {
+			return nil, fmt.Errorf("join group: protocol[%d] name: %w", i, err)
+		}
+		metaLen, err := d.ReadInt32()
+		if err != nil {
+			return nil, fmt.Errorf("join group: protocol[%d] metadata length: %w", i, err)
+		}
+		var metadata []byte
+		if metaLen > 0 {
+			metadata, err = d.ReadBytes(int(metaLen))
+			if err != nil {
+				return nil, fmt.Errorf("join group: protocol[%d] metadata: %w", i, err)
+			}
+		}
+		protocols = append(protocols, JoinGroupProtocol{Name: name, Metadata: metadata})
+	}
+	return &JoinGroupRequest{
+		GroupID:            groupID,
+		SessionTimeoutMs:   sessionTimeoutMs,
+		RebalanceTimeoutMs: rebalanceTimeoutMs,
+		MemberID:           memberID,
+		ProtocolType:       protocolType,
+		Protocols:          protocols,
+	}, nil
+}
+
+// JoinGroupMember describes a member in the JoinGroup response.
+type JoinGroupMember struct {
+	MemberID string
+	Metadata []byte
+}
+
+// EncodeJoinGroupResponse writes a JoinGroup v1 response.
+//
+// Wire layout:
+//
+//	CorrelationID int32
+//	ErrorCode     int16
+//	GenerationID  int32
+//	ProtocolName  string
+//	Leader        string
+//	MemberID      string
+//	members[]
+//	  MemberID    string
+//	  Metadata    bytes (int32 len prefix)
+func (e *Encoder) EncodeJoinGroupResponse(correlationID int32, generationID int32, protocolName, leader, memberID string, members []JoinGroupMember) {
+	e.WriteInt32(correlationID)
+	e.WriteInt16(ErrCodeNone)
+	e.WriteInt32(generationID)
+	e.WriteString(protocolName)
+	e.WriteString(leader)
+	e.WriteString(memberID)
+	e.WriteInt32(int32(len(members)))
+	for _, m := range members {
+		e.WriteString(m.MemberID)
+		e.WriteInt32(int32(len(m.Metadata)))
+		e.WriteBytes(m.Metadata)
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Heartbeat (ApiKey 12, v0)
+// ──────────────────────────────────────────────────────────────────────────────
+
+// HeartbeatRequest (v0) wire layout after the request header:
+//
+//	GroupID      string
+//	GenerationID int32
+//	MemberID     string
+type HeartbeatRequest struct {
+	GroupID      string
+	MemberID     string
+	GenerationID int32
+}
+
+// ParseHeartbeatRequest reads the Heartbeat v0 body.
+func (d *Decoder) ParseHeartbeatRequest(header *RequestHeader) (*HeartbeatRequest, error) {
+	groupID, err := d.ReadString()
+	if err != nil {
+		return nil, fmt.Errorf("heartbeat: read group_id: %w", err)
+	}
+	generationID, err := d.ReadInt32()
+	if err != nil {
+		return nil, fmt.Errorf("heartbeat: read generation_id: %w", err)
+	}
+	memberID, err := d.ReadString()
+	if err != nil {
+		return nil, fmt.Errorf("heartbeat: read member_id: %w", err)
+	}
+	return &HeartbeatRequest{GroupID: groupID, GenerationID: generationID, MemberID: memberID}, nil
+}
+
+// EncodeHeartbeatResponse writes a Heartbeat v0 response.
+//
+// Wire layout:
+//
+//	CorrelationID int32
+//	ErrorCode     int16
+func (e *Encoder) EncodeHeartbeatResponse(correlationID int32) {
+	e.WriteInt32(correlationID)
+	e.WriteInt16(ErrCodeNone)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// LeaveGroup (ApiKey 13, v0)
+// ──────────────────────────────────────────────────────────────────────────────
+
+// LeaveGroupRequest (v0) wire layout after the request header:
+//
+//	GroupID  string
+//	MemberID string
+type LeaveGroupRequest struct {
+	GroupID  string
+	MemberID string
+}
+
+// ParseLeaveGroupRequest reads the LeaveGroup v0 body.
+func (d *Decoder) ParseLeaveGroupRequest(header *RequestHeader) (*LeaveGroupRequest, error) {
+	groupID, err := d.ReadString()
+	if err != nil {
+		return nil, fmt.Errorf("leave group: read group_id: %w", err)
+	}
+	memberID, err := d.ReadString()
+	if err != nil {
+		return nil, fmt.Errorf("leave group: read member_id: %w", err)
+	}
+	return &LeaveGroupRequest{GroupID: groupID, MemberID: memberID}, nil
+}
+
+// EncodeLeaveGroupResponse writes a LeaveGroup v0 response.
+//
+// Wire layout:
+//
+//	CorrelationID int32
+//	ErrorCode     int16
+func (e *Encoder) EncodeLeaveGroupResponse(correlationID int32) {
+	e.WriteInt32(correlationID)
+	e.WriteInt16(ErrCodeNone)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// SyncGroup (ApiKey 14, v0)
+// ──────────────────────────────────────────────────────────────────────────────
+
+// SyncGroupAssignment is one member assignment entry in a SyncGroup request.
+type SyncGroupAssignment struct {
+	MemberID   string
+	Assignment []byte
+}
+
+// SyncGroupRequest (v0) wire layout after the request header:
+//
+//	GroupID      string
+//	GenerationID int32
+//	MemberID     string
+//	assignments[]
+//	  MemberID   string
+//	  Assignment bytes (int32 len prefix)
+type SyncGroupRequest struct {
+	Assignments  []SyncGroupAssignment
+	GroupID      string
+	MemberID     string
+	GenerationID int32
+}
+
+// ParseSyncGroupRequest reads the SyncGroup v0 body.
+func (d *Decoder) ParseSyncGroupRequest(header *RequestHeader) (*SyncGroupRequest, error) {
+	groupID, err := d.ReadString()
+	if err != nil {
+		return nil, fmt.Errorf("sync group: read group_id: %w", err)
+	}
+	generationID, err := d.ReadInt32()
+	if err != nil {
+		return nil, fmt.Errorf("sync group: read generation_id: %w", err)
+	}
+	memberID, err := d.ReadString()
+	if err != nil {
+		return nil, fmt.Errorf("sync group: read member_id: %w", err)
+	}
+	assignCount, err := d.ReadInt32()
+	if err != nil {
+		return nil, fmt.Errorf("sync group: read assignment count: %w", err)
+	}
+	assignments := make([]SyncGroupAssignment, 0, assignCount)
+	for i := int32(0); i < assignCount; i++ {
+		mid, err := d.ReadString()
+		if err != nil {
+			return nil, fmt.Errorf("sync group: assignment[%d] member_id: %w", i, err)
+		}
+		assignLen, err := d.ReadInt32()
+		if err != nil {
+			return nil, fmt.Errorf("sync group: assignment[%d] length: %w", i, err)
+		}
+		var assign []byte
+		if assignLen > 0 {
+			assign, err = d.ReadBytes(int(assignLen))
+			if err != nil {
+				return nil, fmt.Errorf("sync group: assignment[%d] data: %w", i, err)
+			}
+		}
+		assignments = append(assignments, SyncGroupAssignment{MemberID: mid, Assignment: assign})
+	}
+	return &SyncGroupRequest{
+		GroupID:      groupID,
+		GenerationID: generationID,
+		MemberID:     memberID,
+		Assignments:  assignments,
+	}, nil
+}
+
+// EncodeSyncGroupResponse writes a SyncGroup v0 response.
+//
+// Wire layout:
+//
+//	CorrelationID    int32
+//	ErrorCode        int16
+//	MemberAssignment bytes (int32 len prefix)
+func (e *Encoder) EncodeSyncGroupResponse(correlationID int32, assignment []byte) {
+	e.WriteInt32(correlationID)
+	e.WriteInt16(ErrCodeNone)
+	e.WriteInt32(int32(len(assignment)))
+	e.WriteBytes(assignment)
 }
 
 // EncodeMetadataResponse encodes a MetadataResponse into the Encoder.
