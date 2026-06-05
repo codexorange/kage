@@ -176,6 +176,7 @@ func TestHandler_MetadataRequest(t *testing.T) {
 	if corrID != 99 {
 		t.Errorf("correlationID = %d, want 99", corrID)
 	}
+	dec.ReadInt32() // ThrottleTimeMs (v1+)
 	brokerCount, _ := dec.ReadInt32()
 	if brokerCount != 1 {
 		t.Errorf("broker count = %d, want 1", brokerCount)
@@ -183,6 +184,9 @@ func TestHandler_MetadataRequest(t *testing.T) {
 	dec.ReadInt32()  // NodeID
 	dec.ReadString() // host
 	dec.ReadInt32()  // port
+	dec.ReadInt16()  // Rack (nullable string, -1 = null)
+	dec.ReadInt16()  // ClusterID (nullable string, -1 = null)
+	dec.ReadInt32()  // ControllerID
 
 	topicCount, _ := dec.ReadInt32()
 	if topicCount != 1 {
@@ -212,10 +216,14 @@ func TestHandler_MetadataRequest_EmptyTopics(t *testing.T) {
 	body := readResponse(t, clientConn)
 	dec := protocol.NewDecoder(bytes.NewReader(body))
 	dec.ReadInt32() // corrID
+	dec.ReadInt32() // ThrottleTimeMs (v1+)
 	dec.ReadInt32() // broker count
 	dec.ReadInt32() // NodeID
-	dec.ReadString()
-	dec.ReadInt32()
+	dec.ReadString() // host
+	dec.ReadInt32()  // port
+	dec.ReadInt16()  // Rack (nullable string, -1 = null)
+	dec.ReadInt16()  // ClusterID (nullable string, -1 = null)
+	dec.ReadInt32()  // ControllerID
 
 	topicCount, _ := dec.ReadInt32()
 	if topicCount != 2 {

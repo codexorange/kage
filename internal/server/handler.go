@@ -361,9 +361,11 @@ func (h *Handler) handleMetadata(conn net.Conn, dec *protocol.Decoder, header *p
 
 	resp := &protocol.MetadataResponse{
 		Brokers: []protocol.Broker{
-			{NodeID: 1, Host: "localhost", Port: 9092},
+			{NodeID: 1, Host: "localhost", Port: 9092, Rack: nil},
 		},
-		Topics: topicMeta,
+		ClusterID:    nil,
+		ControllerID: 1,
+		Topics:       topicMeta,
 	}
 
 	enc := protocol.NewEncoder()
