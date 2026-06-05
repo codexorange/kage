@@ -92,6 +92,16 @@ func (h *Handler) dispatch(conn net.Conn, dec *protocol.Decoder, header *protoco
 		return h.handleOffsetCommit(conn, dec, header)
 	case protocol.ApiKeyOffsetFetch:
 		return h.handleOffsetFetch(conn, dec, header)
+	case protocol.ApiKeyFindCoordinator:
+		return h.handleFindCoordinator(conn, dec, header)
+	case protocol.ApiKeyJoinGroup:
+		return h.handleJoinGroup(conn, dec, header)
+	case protocol.ApiKeyHeartbeat:
+		return h.handleHeartbeat(conn, dec, header)
+	case protocol.ApiKeyLeaveGroup:
+		return h.handleLeaveGroup(conn, dec, header)
+	case protocol.ApiKeySyncGroup:
+		return h.handleSyncGroup(conn, dec, header)
 	case protocol.ApiKeyApiVersions:
 		return h.handleApiVersions(conn, header)
 	default:
@@ -664,6 +674,134 @@ func encodeOffsetKey(groupID, topic string, partition int32) []byte {
 	pos += len(topic)
 	binary.BigEndian.PutUint32(buf[pos:], uint32(partition))
 	return buf
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Dummy Group Coordinator handlers
+// ──────────────────────────────────────────────────────────────────────────────
+
+const dummyMemberID = "kage-member-1"
+
+// handleFindCoordinator processes a FindCoordinator request (ApiKey 10, v0).
+//
+// Always responds with this broker as the coordinator for any group.
+func (h *Handler) handleFindCoordinator(conn net.Conn, dec *protocol.Decoder, header *protocol.RequestHeader) error {
+	if _, err := dec.ParseFindCoordinatorRequest(header); err != nil {
+		return fmt.Errorf("handleFindCoordinator: parse: %w", err)
+	}
+
+	advertisedHost := os.Getenv("KAGE_ADVERTISED_HOST")
+	if advertisedHost == "" {
+		advertisedHost = "127.0.0.1"
+	}
+
+	enc := protocol.NewEncoder()
+	enc.EncodeFindCoordinatorResponse(header.CorrelationID, 1, advertisedHost, 9092)
+	if _, err := conn.Write(enc.FullMessage()); err != nil {
+		return fmt.Errorf("handleFindCoordinator: write response: %w", err)
+	}
+	return nil
+}
+
+// handleJoinGroup processes a JoinGroup request (ApiKey 11, v1).
+//
+// Always assigns dummyMemberID and designates it as the sole leader and member.
+// The first protocol offered by the client is echoed back as the chosen protocol.
+func (h *Handler) handleJoinGroup(conn net.Conn, dec *protocol.Decoder, header *protocol.RequestHeader) error {
+	req, err := dec.ParseJoinGroupRequest(header)
+	if err != nil {
+		return fmt.Errorf("handleJoinGroup: parse: %w", err)
+	}
+
+	protocolName := ""
+	var leaderMetadata []byte
+	if len(req.Protocols) > 0 {
+		protocolName = req.Protocols[0].Name
+		leaderMetadata = req.Protocols[0].Metadata
+	}
+
+	members := []protocol.JoinGroupMember{
+		{MemberID: dummyMemberID, Metadata: leaderMetadata},
+	}
+
+	h.logger.Info("join group",
+		"group", req.GroupID,
+		"protocol_type", req.ProtocolType,
+		"protocol", protocolName,
+	)
+
+	enc := protocol.NewEncoder()
+	enc.EncodeJoinGroupResponse(header.CorrelationID, 1, protocolName, dummyMemberID, dummyMemberID, members)
+	if _, err := conn.Write(enc.FullMessage()); err != nil {
+		return fmt.Errorf("handleJoinGroup: write response: %w", err)
+	}
+	return nil
+}
+
+// handleHeartbeat processes a Heartbeat request (ApiKey 12, v0).
+//
+// Always responds with ErrorCode 0 (success) to keep the consumer alive.
+func (h *Handler) handleHeartbeat(conn net.Conn, dec *protocol.Decoder, header *protocol.RequestHeader) error {
+	if _, err := dec.ParseHeartbeatRequest(header); err != nil {
+		return fmt.Errorf("handleHeartbeat: parse: %w", err)
+	}
+
+	enc := protocol.NewEncoder()
+	enc.EncodeHeartbeatResponse(header.CorrelationID)
+	if _, err := conn.Write(enc.FullMessage()); err != nil {
+		return fmt.Errorf("handleHeartbeat: write response: %w", err)
+	}
+	return nil
+}
+
+// handleLeaveGroup processes a LeaveGroup request (ApiKey 13, v0).
+//
+// Always responds with ErrorCode 0 (success).
+func (h *Handler) handleLeaveGroup(conn net.Conn, dec *protocol.Decoder, header *protocol.RequestHeader) error {
+	if _, err := dec.ParseLeaveGroupRequest(header); err != nil {
+		return fmt.Errorf("handleLeaveGroup: parse: %w", err)
+	}
+
+	enc := protocol.NewEncoder()
+	enc.EncodeLeaveGroupResponse(header.CorrelationID)
+	if _, err := conn.Write(enc.FullMessage()); err != nil {
+		return fmt.Errorf("handleLeaveGroup: write response: %w", err)
+	}
+	return nil
+}
+
+// handleSyncGroup processes a SyncGroup request (ApiKey 14, v0).
+//
+// Echo strategy: find the assignment for dummyMemberID in the request and
+// return it verbatim. If no matching assignment is found (e.g. follower path),
+// return an empty assignment — the client will re-join and the leader will
+// retransmit.
+func (h *Handler) handleSyncGroup(conn net.Conn, dec *protocol.Decoder, header *protocol.RequestHeader) error {
+	req, err := dec.ParseSyncGroupRequest(header)
+	if err != nil {
+		return fmt.Errorf("handleSyncGroup: parse: %w", err)
+	}
+
+	var assignment []byte
+	for _, a := range req.Assignments {
+		if a.MemberID == dummyMemberID {
+			assignment = a.Assignment
+			break
+		}
+	}
+
+	h.logger.Info("sync group",
+		"group", req.GroupID,
+		"generation_id", req.GenerationID,
+		"assignment_bytes", len(assignment),
+	)
+
+	enc := protocol.NewEncoder()
+	enc.EncodeSyncGroupResponse(header.CorrelationID, assignment)
+	if _, err := conn.Write(enc.FullMessage()); err != nil {
+		return fmt.Errorf("handleSyncGroup: write response: %w", err)
+	}
+	return nil
 }
 
 // encodeOffsetRecord builds the opaque byte slice appended to __consumer_offsets.
