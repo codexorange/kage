@@ -966,8 +966,8 @@ type apiVersion struct {
 // Versions are capped to what our parsers/encoders actually implement to prevent
 // byte-alignment bugs when clients negotiate higher versions than we support.
 var supportedAPIVersions = []apiVersion{
-	{Key: ApiKeyProduce, MinVersion: 0, MaxVersion: 3},  // v3: transactional_id + RecordBatch magic 2
-	{Key: ApiKeyFetch, MinVersion: 0, MaxVersion: 4},    // capped: handleFetch implements v4 layout
+	{Key: ApiKeyProduce, MinVersion: 0, MaxVersion: 3}, // v3: transactional_id + RecordBatch magic 2
+	{Key: ApiKeyFetch, MinVersion: 0, MaxVersion: 4},   // capped: handleFetch implements v4 layout
 	{Key: ApiKeyListOffsets, MinVersion: 0, MaxVersion: 1},
 	{Key: ApiKeyMetadata, MinVersion: 0, MaxVersion: 9},
 	{Key: ApiKeyOffsetCommit, MinVersion: 0, MaxVersion: 2},

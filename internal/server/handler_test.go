@@ -1332,7 +1332,7 @@ func TestHandler_ListOffsets_Earliest(t *testing.T) {
 	if corrID != 55 {
 		t.Errorf("correlationID = %d, want 55", corrID)
 	}
-	dec.ReadInt32() // topic count
+	dec.ReadInt32()  // topic count
 	dec.ReadString() // topic name
 	dec.ReadInt32()  // partition count
 	dec.ReadInt32()  // partition index
@@ -1364,8 +1364,8 @@ func TestHandler_ListOffsets_Latest_Empty(t *testing.T) {
 	body := readResponse(t, clientConn)
 	dec := protocol.NewDecoder(bytes.NewReader(body))
 
-	dec.ReadInt32() // correlationID
-	dec.ReadInt32() // topic count
+	dec.ReadInt32()  // correlationID
+	dec.ReadInt32()  // topic count
 	dec.ReadString() // topic name
 	dec.ReadInt32()  // partition count
 	dec.ReadInt32()  // partition index
@@ -1407,8 +1407,8 @@ func TestHandler_ListOffsets_Latest_AfterProduce(t *testing.T) {
 	body := readResponse(t, clientConn)
 	dec := protocol.NewDecoder(bytes.NewReader(body))
 
-	dec.ReadInt32() // correlationID
-	dec.ReadInt32() // topic count
+	dec.ReadInt32()  // correlationID
+	dec.ReadInt32()  // topic count
 	dec.ReadString() // topic name
 	dec.ReadInt32()  // partition count
 	dec.ReadInt32()  // partition index
