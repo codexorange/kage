@@ -541,6 +541,8 @@ func decodeFetchResponse(t *testing.T, body []byte) (corrID int32, throttleMs in
 			partition, _ := dec.ReadInt32()
 			errCode, _ := dec.ReadInt16()
 			hwm, _ := dec.ReadInt64()
+			dec.ReadInt64() // LastStableOffset (v4+)
+			dec.ReadInt32() // AbortedTransactions array length (v4+)
 			batchSize, _ := dec.ReadInt32()
 			var batch []byte
 			if batchSize > 0 {

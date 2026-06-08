@@ -473,16 +473,18 @@ type FetchTopicResponse struct {
 
 // FetchResponse (v4) wire layout:
 //
-//	CorrelationID  int32
-//	ThrottleTimeMs int32
+//	CorrelationID        int32
+//	ThrottleTimeMs       int32
 //	topics[]
-//	  TopicName    string
+//	  TopicName          string
 //	  partitions[]
-//	    Partition      int32
-//	    ErrorCode      int16
-//	    HighWatermark  int64
-//	    BatchSize      int32   (-1 when no records)
-//	    RecordBatch    []byte  (absent when BatchSize == -1)
+//	    Partition            int32
+//	    ErrorCode            int16
+//	    HighWatermark        int64
+//	    LastStableOffset     int64  (v4+: set equal to HighWatermark)
+//	    AbortedTransactions  int32  (v4+: array length, always 0 — no transactions)
+//	    BatchSize            int32  (-1 when no records)
+//	    RecordBatch          []byte (absent when BatchSize == -1)
 type FetchResponse struct {
 	Topics         []FetchTopicResponse // 24 bytes
 	ThrottleTimeMs int32                // 4 bytes
@@ -497,8 +499,8 @@ type FetchResponse struct {
 // protocol: [partition meta][batch bytes] interleaved per partition.
 func WriteFetchResponse(w io.Writer, correlationID int32, resp *FetchResponse) error {
 	// Pre-compute total payload size.
-	// Per-partition fixed fields: partition(4) + errCode(2) + hwm(8) + batchSize(4) = 18 bytes.
-	const partitionFixedBytes = 18
+	// Per-partition fixed fields: partition(4) + errCode(2) + hwm(8) + lastStableOffset(8) + abortedTxns(4) + batchSize(4) = 30 bytes.
+	const partitionFixedBytes = 30
 	// Frame header: corrID(4) + throttle(4) + topicCount(4) = 12 bytes.
 	totalPayload := int32(12)
 	for _, t := range resp.Topics {
@@ -546,6 +548,8 @@ func WriteFetchResponse(w io.Writer, correlationID int32, resp *FetchResponse) e
 			partEnc.WriteInt32(p.Partition)
 			partEnc.WriteInt16(p.ErrorCode)
 			partEnc.WriteInt64(p.HighWatermark)
+			partEnc.WriteInt64(p.HighWatermark) // LastStableOffset (v4+): mirrors HWM for non-transactional data
+			partEnc.WriteInt32(0)               // AbortedTransactions array length (v4+): always empty
 			partEnc.WriteInt32(p.BatchSize)
 			if _, err := w.Write(partEnc.buffer.Bytes()); err != nil {
 				return err
