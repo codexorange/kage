@@ -190,6 +190,9 @@ func (d *Decoder) ParseProduceRequest(header *RequestHeader) (*ProduceRequest, e
 	if err != nil {
 		return nil, fmt.Errorf("produce request: read topic count: %w", err)
 	}
+	if topicCount < 0 || topicCount > 1024 {
+		return nil, fmt.Errorf("produce request: invalid topic count %d", topicCount)
+	}
 
 	topics := make([]ProduceTopicData, 0, topicCount)
 	for i := int32(0); i < topicCount; i++ {
@@ -201,6 +204,9 @@ func (d *Decoder) ParseProduceRequest(header *RequestHeader) (*ProduceRequest, e
 		partCount, err := d.ReadInt32()
 		if err != nil {
 			return nil, fmt.Errorf("produce request: topic[%d] partition count: %w", i, err)
+		}
+		if partCount < 0 || partCount > 1024 {
+			return nil, fmt.Errorf("produce request: topic[%d] invalid partition count %d", i, partCount)
 		}
 
 		partitions := make([]ProducePartitionData, 0, partCount)
@@ -256,7 +262,7 @@ type ProduceTopicResponse struct {
 	Partitions []ProducePartitionResponse
 }
 
-// ProduceResponse (v0) wire layout:
+// ProduceResponse (v2) wire layout:
 //
 //	CorrelationID int32
 //	topics[]
@@ -265,11 +271,16 @@ type ProduceTopicResponse struct {
 //	    Partition  int32
 //	    ErrorCode  int16
 //	    BaseOffset int64
+//	    Timestamp  int64  (-1 = no timestamp override; added in v2)
+//	ThrottleTimeMs int32  (added in v1; always 0 here)
 type ProduceResponse struct {
 	Topics []ProduceTopicResponse
 }
 
-// EncodeProduceResponse serialises a ProduceResponse into the Encoder.
+// EncodeProduceResponse serialises a ProduceResponse (v2) into the Encoder.
+// v2 adds Timestamp (int64) after BaseOffset for each partition, and
+// ThrottleTimeMs (int32) at the end of the payload.
+// Omitting these fields leaves the client waiting for bytes that never arrive.
 func (e *Encoder) EncodeProduceResponse(correlationID int32, resp *ProduceResponse) {
 	e.WriteInt32(correlationID)
 
@@ -281,8 +292,10 @@ func (e *Encoder) EncodeProduceResponse(correlationID int32, resp *ProduceRespon
 			e.WriteInt32(p.Partition)
 			e.WriteInt16(p.ErrorCode)
 			e.WriteInt64(p.BaseOffset)
+			e.WriteInt64(-1) // Timestamp: -1 means no log-append-time override
 		}
 	}
+	e.WriteInt32(0) // ThrottleTimeMs
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

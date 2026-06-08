@@ -210,6 +210,17 @@ func TestEncodeProduceResponse(t *testing.T) {
 	if baseOffset != 1024 {
 		t.Errorf("base offset = %d, want 1024", baseOffset)
 	}
+
+	// v2 adds Timestamp per partition (-1 = no override) and ThrottleTimeMs at end.
+	timestamp, _ := dec.ReadInt64()
+	if timestamp != -1 {
+		t.Errorf("timestamp = %d, want -1", timestamp)
+	}
+
+	throttleTimeMs, _ := dec.ReadInt32()
+	if throttleTimeMs != 0 {
+		t.Errorf("throttle_time_ms = %d, want 0", throttleTimeMs)
+	}
 }
 
 func TestEncodeProduceResponse_MultipleTopics(t *testing.T) {

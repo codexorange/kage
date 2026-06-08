@@ -49,9 +49,9 @@ func TestParseMetadataRequest_TruncatedTopicName(t *testing.T) {
 // TestParseProduceRequest_TruncatedMidParse covers error returns after the
 // first field in ParseProduceRequest.
 func TestParseProduceRequest_TruncatedMidParse(t *testing.T) {
-	// Build a fully valid body and truncate at each field boundary.
+	// Build a fully valid v2 body (no transactional_id) and truncate at each
+	// field boundary.
 	var full bytes.Buffer
-	binary.Write(&full, binary.BigEndian, int16(-1))   // txnID: null
 	binary.Write(&full, binary.BigEndian, int16(1))    // acks
 	binary.Write(&full, binary.BigEndian, int32(5000)) // timeoutMs
 	binary.Write(&full, binary.BigEndian, int32(1))    // topic count
@@ -63,8 +63,8 @@ func TestParseProduceRequest_TruncatedMidParse(t *testing.T) {
 	full.WriteString("abc")
 
 	data := full.Bytes()
-	// Truncate after: txnID(2), acks(4), timeoutMs(8), topicCount(12), topicNameLen(14), partCount(21), partIdx(25), batchSize(29)
-	for _, cutAt := range []int{2, 4, 8, 12, 14, 21, 25, 29} {
+	// Truncate after: acks(2), timeoutMs(6), topicCount(10), topicNameLen(12), topicName(17), partCount(21), partIdx(25), batchSize(29)
+	for _, cutAt := range []int{2, 6, 10, 12, 17, 21, 25, 29} {
 		_, err := NewDecoder(bytes.NewReader(data[:cutAt])).ParseProduceRequest(&RequestHeader{})
 		if err == nil {
 			t.Errorf("cutAt=%d: expected error, got nil", cutAt)
@@ -76,7 +76,6 @@ func TestParseProduceRequest_TruncatedMidParse(t *testing.T) {
 // error path.
 func TestParseProduceRequest_NegativeBatchSize(t *testing.T) {
 	var buf bytes.Buffer
-	binary.Write(&buf, binary.BigEndian, int16(-1))   // txnID: null
 	binary.Write(&buf, binary.BigEndian, int16(1))    // acks
 	binary.Write(&buf, binary.BigEndian, int32(5000)) // timeoutMs
 	binary.Write(&buf, binary.BigEndian, int32(1))    // topic count
