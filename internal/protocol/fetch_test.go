@@ -219,6 +219,15 @@ func TestEncodeFetchResponse_SinglePartition(t *testing.T) {
 		t.Errorf("high watermark = %d, want 2048", hwm)
 	}
 
+	lso, _ := dec.ReadInt64() // LastStableOffset (v4+)
+	if lso != 2048 {
+		t.Errorf("last stable offset = %d, want 2048", lso)
+	}
+	abortedLen, _ := dec.ReadInt32() // AbortedTransactions array length (v4+)
+	if abortedLen != 0 {
+		t.Errorf("aborted transactions length = %d, want 0", abortedLen)
+	}
+
 	batchSize, _ := dec.ReadInt32()
 	if batchSize != int32(len(batchData)) {
 		t.Errorf("batch size = %d, want %d", batchSize, len(batchData))
@@ -257,6 +266,8 @@ func TestEncodeFetchResponse_NullBatch(t *testing.T) {
 		t.Errorf("error code = %d, want %d", errCode, ErrCodeOffsetOutOfRange)
 	}
 	dec.ReadInt64() // hwm
+	dec.ReadInt64() // LastStableOffset (v4+)
+	dec.ReadInt32() // AbortedTransactions array length (v4+)
 	batchSize, _ := dec.ReadInt32()
 	if batchSize != -1 {
 		t.Errorf("batch size = %d, want -1 (null records)", batchSize)
@@ -323,6 +334,8 @@ func TestEncodeFetchResponse_RoundTrip(t *testing.T) {
 	dec.ReadInt32()  // partition
 	dec.ReadInt16()  // error code
 	dec.ReadInt64()  // high watermark
+	dec.ReadInt64()  // LastStableOffset (v4+)
+	dec.ReadInt32()  // AbortedTransactions array length (v4+)
 	sz, _ := dec.ReadInt32()
 	got, _ := dec.ReadBytes(int(sz))
 	if !bytes.Equal(got, batchData) {
