@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -325,22 +326,73 @@ func (h *Handler) handleFetch(conn net.Conn, dec *protocol.Decoder, header *prot
 				continue
 			}
 
-			// Strip the 4-byte on-disk framing header to expose the raw RecordBatch.
-			var hdrBuf [recHdr]byte
-			if _, err := io.ReadFull(r, hdrBuf[:]); err != nil {
-				h.logger.Error("fetch: read record header failed",
+			// Materialise the full record (header + payload) into a mutable buffer.
+			// We need a []byte to both strip the on-disk framing header and patch
+			// BaseOffset in-place before handing data to WriteFetchResponse.
+			raw := make([]byte, n)
+			if _, err := io.ReadFull(r, raw); err != nil {
+				h.logger.Error("fetch: read record body failed",
 					"topic", topic.TopicName, "partition", part.Partition, "error", err)
 				partResp.ErrorCode = protocol.ErrCodeOffsetOutOfRange
 				topicResp.Partitions = append(topicResp.Partitions, partResp)
 				continue
 			}
-			payloadLen := int32(binary.BigEndian.Uint32(hdrBuf[:]))
-			if payloadLen <= 0 || payloadLen > n-recHdr {
-				payloadLen = n - recHdr
+
+			// Strip the 4-byte on-disk framing header to expose the raw RecordBatch.
+			if len(raw) < recHdr {
+				h.logger.Error("fetch: record buffer too short",
+					"topic", topic.TopicName, "partition", part.Partition, "len", len(raw))
+				partResp.ErrorCode = protocol.ErrCodeOffsetOutOfRange
+				topicResp.Partitions = append(topicResp.Partitions, partResp)
+				continue
+			}
+			payload := raw[recHdr:]
+
+			// Patch BaseOffset in each RecordBatch so KafkaJS sees monotonically
+			// increasing logical offsets instead of raw physical byte positions.
+			//
+			// Kafka RecordBatch v2 wire layout (offsets relative to batch start):
+			//   [0:8]   BaseOffset        int64  — patched here
+			//   [8:12]  Length            int32  — byte count from byte 12 to end
+			//   [12:16] PartitionLeaderEpoch int32
+			//   [16]    MagicByte         int8
+			//   [17:21] CRC               int32  — covers bytes [21, 12+Length)
+			//   [23:27] LastOffsetDelta   int32  — relative offset of last record
+			//
+			// BaseOffset is before the CRC-protected region, so patching it does
+			// not invalidate the checksum.
+			//
+			// KafkaJS advances its fetch cursor as:
+			//   NextFetchOffset = BaseOffset + LastOffsetDelta + 1
+			//
+			// We want NextFetchOffset to equal the physical byte offset of the
+			// next batch on disk so subsequent Fetch requests land correctly:
+			//   targetBaseOffset = nextPhysicalOffset - LastOffsetDelta - 1
+			currentPos := uint64(part.FetchOffset)
+			pos := 0
+			const (
+				rbBaseOffset      = 0
+				rbLength          = 8
+				rbLastOffsetDelta = 23 // relative to batch start, within CRC body
+				rbMinPatchBytes   = 27 // need at least bytes 0–26 to patch
+			)
+			for pos+rbMinPatchBytes <= len(payload) {
+				batchLen := int(binary.BigEndian.Uint32(payload[pos+rbLength : pos+rbLength+4]))
+				totalBatchBytes := 12 + batchLen // BaseOffset(8)+Length(4) + Length bytes
+				if pos+totalBatchBytes > len(payload) {
+					break // truncated batch — stop patching
+				}
+				lastOffsetDelta := int32(binary.BigEndian.Uint32(payload[pos+rbLastOffsetDelta : pos+rbLastOffsetDelta+4]))
+				nextPhysical := currentPos + uint64(recHdr) + uint64(totalBatchBytes)
+				targetBase := nextPhysical - uint64(lastOffsetDelta) - 1
+				binary.BigEndian.PutUint64(payload[pos+rbBaseOffset:pos+rbBaseOffset+8], targetBase)
+				currentPos = nextPhysical - uint64(recHdr) // advance to start of next on-disk record
+				pos += totalBatchBytes
 			}
 
+			payloadLen := int32(len(payload))
 			partResp.ErrorCode = protocol.ErrCodeNone
-			partResp.RecordBatch = io.LimitReader(r, int64(payloadLen))
+			partResp.RecordBatch = bytes.NewReader(payload)
 			partResp.BatchSize = payloadLen
 			remaining -= payloadLen
 
