@@ -48,6 +48,12 @@ func (d *Decoder) ReadBytes(n int) ([]byte, error) {
 	return buf, err
 }
 
+func (d *Decoder) ReadBool() (bool, error) {
+	var value int8
+	err := binary.Read(d.reader, binary.BigEndian, &value)
+	return value != 0, err
+}
+
 func (d *Decoder) ReadString() (string, error) {
 	length, err := d.ReadInt16()
 	if err != nil || length <= 0 {
