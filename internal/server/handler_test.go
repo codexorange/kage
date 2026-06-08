@@ -1452,3 +1452,82 @@ func TestHandler_ListOffsets_Latest_AfterProduce(t *testing.T) {
 		t.Errorf("latest offset after produce = %d, want > 0", offset)
 	}
 }
+
+// TestHandler_FetchRequest_BaseOffsetPatched verifies the physical-to-logical
+// offset bridge. After producing two batches, fetching the second batch from
+// its physical offset must return a RecordBatch whose BaseOffset satisfies:
+//
+//	BaseOffset + LastOffsetDelta + 1 == physicalOffsetOfNextBatch
+//
+// This is the exact formula KafkaJS uses to advance its fetch cursor, so
+// getting this right prevents silent message discard ("duplicate" detection).
+func TestHandler_FetchRequest_BaseOffsetPatched(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	h, _ := newTestHandler(t)
+	go h.Handle(serverConn)
+
+	// Produce the first batch and immediately fetch it so we can read the
+	// HighWatermark, which equals the physical byte offset where the second
+	// batch will start.
+	frame1 := buildProduceRequestFrame(1, "p", protocol.AcksLeader, []protocol.ProduceTopicData{
+		{TopicName: "t", Partitions: []protocol.ProducePartitionData{
+			{Partition: 0, RecordBatch: []byte("first-batch")},
+		}},
+	})
+	clientConn.Write(frame1)
+	readResponse(t, clientConn)
+
+	fetchFrame1 := buildFetchRequestFrame(10, "c", 1<<20, map[string][]fetchPartition{
+		"t": {{partition: 0, fetchOffset: 0, partitionMaxBytes: 1 << 20}},
+	})
+	clientConn.Write(fetchFrame1)
+	body1 := readResponse(t, clientConn)
+	_, _, topics1 := decodeFetchResponse(t, body1)
+	if len(topics1) == 0 || len(topics1[0].partitions) == 0 {
+		t.Fatal("no partitions in first fetch response")
+	}
+	// HWM after first batch = physical byte start of the second batch.
+	secondBatchOffset := topics1[0].partitions[0].highWatermark
+
+	// Produce the second batch.
+	frame2 := buildProduceRequestFrame(2, "p", protocol.AcksLeader, []protocol.ProduceTopicData{
+		{TopicName: "t", Partitions: []protocol.ProducePartitionData{
+			{Partition: 0, RecordBatch: []byte("second-batch")},
+		}},
+	})
+	clientConn.Write(frame2)
+	readResponse(t, clientConn)
+
+	// Fetch from the second batch's physical offset.
+	fetchFrame2 := buildFetchRequestFrame(11, "c", 1<<20, map[string][]fetchPartition{
+		"t": {{partition: 0, fetchOffset: secondBatchOffset, partitionMaxBytes: 1 << 20}},
+	})
+	clientConn.Write(fetchFrame2)
+	body2 := readResponse(t, clientConn)
+	_, _, topics2 := decodeFetchResponse(t, body2)
+	if len(topics2) == 0 || len(topics2[0].partitions) == 0 {
+		t.Fatal("no partitions in second fetch response")
+	}
+	batch := topics2[0].partitions[0].batch
+	if len(batch) < 27 {
+		t.Fatalf("second batch too short to parse: %d bytes", len(batch))
+	}
+
+	// Parse the patched RecordBatch header fields.
+	baseOffset := int64(binary.BigEndian.Uint64(batch[0:8]))
+	batchLen := int(binary.BigEndian.Uint32(batch[8:12]))
+	lastOffsetDelta := int32(binary.BigEndian.Uint32(batch[23:27]))
+
+	// KafkaJS next-cursor formula must point to the next physical batch start.
+	// recHdr(4) is the on-disk length prefix that precedes the RecordBatch.
+	const recHdr = 4
+	nextCursor := baseOffset + int64(lastOffsetDelta) + 1
+	expectedNext := secondBatchOffset + recHdr + int64(12+batchLen)
+
+	if nextCursor != expectedNext {
+		t.Errorf("next cursor = %d, want %d (BaseOffset=%d LastOffsetDelta=%d batchLen=%d)",
+			nextCursor, expectedNext, baseOffset, lastOffsetDelta, batchLen)
+	}
+}
