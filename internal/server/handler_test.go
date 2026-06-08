@@ -942,16 +942,17 @@ func TestHandler_ProduceRequest_StorageError_ReportsErrorCode(t *testing.T) {
 
 var ctx = context.Background()
 
-// TestHandler_FetchRequest_StorageError_ReportsErrorCode verifies that a
-// storage read error (offset out of range on empty partition) returns an error code.
-func TestHandler_FetchRequest_StorageError_ReportsErrorCode(t *testing.T) {
+// TestHandler_FetchRequest_CaughtUp verifies that fetching at exactly the
+// HighWatermark (consumer is caught up) returns success with an empty batch,
+// not ErrCodeOffsetOutOfRange.
+func TestHandler_FetchRequest_CaughtUp(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
 	defer clientConn.Close()
 
 	h, _ := newTestHandler(t)
 	go h.Handle(serverConn)
 
-	// Fetch from a partition with nothing written — offset 0 is out of range.
+	// Empty partition: Size()=0, so FetchOffset=0 == HighWatermark=0.
 	frame := buildFetchRequestFrame(77, "c", 1024, map[string][]fetchPartition{
 		"t": {{partition: 0, fetchOffset: 0, partitionMaxBytes: 1024}},
 	})
@@ -961,8 +962,35 @@ func TestHandler_FetchRequest_StorageError_ReportsErrorCode(t *testing.T) {
 	_, _, topics := decodeFetchResponse(t, body)
 
 	p := topics[0].partitions[0]
-	if p.errorCode == 0 {
-		t.Error("expected non-zero error code on storage failure")
+	if p.errorCode != 0 {
+		t.Errorf("error code = %d, want 0 (caught up is not an error)", p.errorCode)
+	}
+	if p.batchSize != -1 {
+		t.Errorf("batch size = %d, want -1 (empty batch when caught up)", p.batchSize)
+	}
+}
+
+// TestHandler_FetchRequest_FutureOffset verifies that fetching beyond the
+// HighWatermark returns ErrCodeOffsetOutOfRange.
+func TestHandler_FetchRequest_FutureOffset(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	h, _ := newTestHandler(t)
+	go h.Handle(serverConn)
+
+	// Partition is empty (HWM=0); requesting offset 999 is a genuine future offset.
+	frame := buildFetchRequestFrame(78, "c", 1024, map[string][]fetchPartition{
+		"t": {{partition: 0, fetchOffset: 999, partitionMaxBytes: 1024}},
+	})
+	clientConn.Write(frame)
+
+	body := readResponse(t, clientConn)
+	_, _, topics := decodeFetchResponse(t, body)
+
+	p := topics[0].partitions[0]
+	if p.errorCode != protocol.ErrCodeOffsetOutOfRange {
+		t.Errorf("error code = %d, want %d (ErrCodeOffsetOutOfRange)", p.errorCode, protocol.ErrCodeOffsetOutOfRange)
 	}
 }
 
