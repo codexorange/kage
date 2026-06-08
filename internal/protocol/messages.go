@@ -118,7 +118,11 @@ func (d *Decoder) ParseRequestHeader() (*RequestHeader, error) {
 }
 
 // ParseMetadataRequest reads a MetadataRequest body after the header has been parsed.
-// Format: [topics_array_len int32] ([topic_name string] ...)
+//
+// Wire layout:
+//
+//	v0–v3:  topics[] string
+//	v4+:    topics[] string  +  allow_auto_topic_creation bool (1 byte)
 func (d *Decoder) ParseMetadataRequest(header *RequestHeader) (*MetadataRequest, error) {
 	count, err := d.ReadInt32()
 	if err != nil {
@@ -132,6 +136,14 @@ func (d *Decoder) ParseMetadataRequest(header *RequestHeader) (*MetadataRequest,
 			return nil, fmt.Errorf("metadata request: failed to read topic name at index %d: %w", i, err)
 		}
 		topics = append(topics, name)
+	}
+
+	// v4+ appends a boolean field (allow_auto_topic_creation). Consume it to
+	// keep the TCP read buffer aligned for the next request frame.
+	if header.ApiVersion >= 4 {
+		if _, err := d.ReadBool(); err != nil {
+			return nil, fmt.Errorf("metadata request: failed to read allow_auto_topic_creation: %w", err)
+		}
 	}
 
 	return &MetadataRequest{Header: header, Topics: topics}, nil
