@@ -231,9 +231,9 @@ func (h *Handler) handleProduce(conn net.Conn, dec *protocol.Decoder, header *pr
 // handleFetch processes a FetchRequest (ApiKey 1, v4).
 //
 // For each topic-partition requested:
-//   - Clamp the effective max bytes to min(PartitionMaxBytes, remaining global MaxBytes).
-//   - Read bytes from storage starting at FetchOffset.
-//   - On ErrInvalidOffset, respond with ErrCodeOffsetOutOfRange.
+//   - FetchOffset == HighWatermark: consumer is caught up; return success with empty batch.
+//   - FetchOffset > HighWatermark: return ErrCodeOffsetOutOfRange (genuine future offset).
+//   - FetchOffset < HighWatermark: clamp effective max bytes, read from storage, stream back.
 //   - Decrement the global bytes budget after each successful read.
 func (h *Handler) handleFetch(conn net.Conn, dec *protocol.Decoder, header *protocol.RequestHeader) error {
 	req, err := dec.ParseFetchRequest(header)
@@ -272,6 +272,23 @@ func (h *Handler) handleFetch(conn net.Conn, dec *protocol.Decoder, header *prot
 			}
 
 			partResp.HighWatermark = ps.Size()
+
+			// Offset == HighWatermark: consumer is caught up, no new data yet.
+			// Return success with an empty batch rather than an error — this is
+			// normal Kafka semantics and prevents the consumer from looping on
+			// ErrCodeOffsetOutOfRange when it is fully up-to-date.
+			if part.FetchOffset == partResp.HighWatermark {
+				partResp.ErrorCode = protocol.ErrCodeNone
+				topicResp.Partitions = append(topicResp.Partitions, partResp)
+				continue
+			}
+
+			// Offset beyond HighWatermark: genuinely out of range.
+			if part.FetchOffset > partResp.HighWatermark {
+				partResp.ErrorCode = protocol.ErrCodeOffsetOutOfRange
+				topicResp.Partitions = append(topicResp.Partitions, partResp)
+				continue
+			}
 
 			cap := part.PartitionMaxBytes
 			if remaining < cap {
