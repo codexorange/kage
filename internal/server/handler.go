@@ -301,7 +301,10 @@ func (h *Handler) handleFetch(conn net.Conn, dec *protocol.Decoder, header *prot
 				continue
 			}
 
-			r, n, err := ps.Read(uint64(part.FetchOffset), cap)
+			// Request recordHeaderSize extra bytes so we can read and discard the
+			// on-disk length prefix before forwarding the payload to the client.
+			const recHdr = 4 // storage.recordHeaderSize — uint32 BE payload length
+			r, n, err := ps.Read(uint64(part.FetchOffset), cap+recHdr)
 			if err != nil {
 				if errors.Is(err, storage.ErrInvalidOffset) {
 					h.logger.Warn("fetch: offset out of range",
@@ -322,10 +325,24 @@ func (h *Handler) handleFetch(conn net.Conn, dec *protocol.Decoder, header *prot
 				continue
 			}
 
+			// Strip the 4-byte on-disk framing header to expose the raw RecordBatch.
+			var hdrBuf [recHdr]byte
+			if _, err := io.ReadFull(r, hdrBuf[:]); err != nil {
+				h.logger.Error("fetch: read record header failed",
+					"topic", topic.TopicName, "partition", part.Partition, "error", err)
+				partResp.ErrorCode = protocol.ErrCodeOffsetOutOfRange
+				topicResp.Partitions = append(topicResp.Partitions, partResp)
+				continue
+			}
+			payloadLen := int32(binary.BigEndian.Uint32(hdrBuf[:]))
+			if payloadLen <= 0 || payloadLen > n-recHdr {
+				payloadLen = n - recHdr
+			}
+
 			partResp.ErrorCode = protocol.ErrCodeNone
-			partResp.RecordBatch = r
-			partResp.BatchSize = n
-			remaining -= n
+			partResp.RecordBatch = io.LimitReader(r, int64(payloadLen))
+			partResp.BatchSize = payloadLen
+			remaining -= payloadLen
 
 			h.metrics.MessagesFetchedTotal.WithLabelValues(topic.TopicName).Inc()
 			h.logger.Info("fetch: batch served",

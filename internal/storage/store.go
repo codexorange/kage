@@ -105,12 +105,12 @@ func (ps *PartitionStore) rollover() error {
 	return nil
 }
 
-// Read returns an io.Reader for the record batch starting at fetchOffset,
-// capped to maxBytes.  It reads from the active segment only; multi-segment
-// reads are not yet supported (the active segment holds the full log for now).
+// Read returns an io.Reader for the record at fetchOffset, capped to maxBytes.
+// It reads from the active segment only; multi-segment reads are not yet supported.
 //
 // fetchOffset is the byte offset returned by a prior Append call.
 // maxBytes caps how many bytes are served; it must be > 0.
+// Returns ErrInvalidOffset when fetchOffset is beyond the written data.
 func (ps *PartitionStore) Read(fetchOffset uint64, maxBytes int32) (io.Reader, int32, error) {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
