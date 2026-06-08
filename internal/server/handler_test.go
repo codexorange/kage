@@ -116,6 +116,24 @@ func buildValidRecordBatch(payload []byte) []byte {
 	return buf
 }
 
+// buildListOffsetsRequestFrame builds a complete ListOffsetsRequest v1 frame.
+func buildListOffsetsRequestFrame(correlationID int32, clientID string, topics []protocol.ListOffsetsTopicRequest) []byte {
+	var body bytes.Buffer
+	body.Write(buildRequestHeader(protocol.ApiKeyListOffsets, 1, correlationID, clientID))
+	binary.Write(&body, binary.BigEndian, int32(-1)) // replicaID = -1 (consumer)
+	binary.Write(&body, binary.BigEndian, int32(len(topics)))
+	for _, t := range topics {
+		binary.Write(&body, binary.BigEndian, int16(len(t.TopicName)))
+		body.WriteString(t.TopicName)
+		binary.Write(&body, binary.BigEndian, int32(len(t.Partitions)))
+		for _, p := range t.Partitions {
+			binary.Write(&body, binary.BigEndian, p.Partition)
+			binary.Write(&body, binary.BigEndian, p.Timestamp)
+		}
+	}
+	return buildFrame(body.Bytes())
+}
+
 // buildProduceRequestFrame builds a complete ProduceRequest v2 frame.
 // Each partition's RecordBatch is wrapped in a valid RecordBatch v2 envelope.
 // v2 layout: Acks(int16) | TimeoutMs(int32) | topics[] — no transactional_id.
@@ -1288,5 +1306,119 @@ func TestHandler_OffsetCommit_WritesToConsumerOffsetsTopic(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("expected %q topic to exist in BrokerStore after commit", protocol.ConsumerOffsetsTopic)
+	}
+}
+
+// ── ListOffsets handler tests ──────────────────────────────────────────────────
+
+func TestHandler_ListOffsets_Earliest(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	h, _ := newTestHandler(t)
+	go h.Handle(serverConn)
+
+	req := buildListOffsetsRequestFrame(55, "test", []protocol.ListOffsetsTopicRequest{
+		{TopicName: "events", Partitions: []protocol.ListOffsetsPartitionRequest{
+			{Partition: 0, Timestamp: protocol.TimestampEarliest},
+		}},
+	})
+	clientConn.Write(req)
+
+	body := readResponse(t, clientConn)
+	dec := protocol.NewDecoder(bytes.NewReader(body))
+
+	corrID, _ := dec.ReadInt32()
+	if corrID != 55 {
+		t.Errorf("correlationID = %d, want 55", corrID)
+	}
+	dec.ReadInt32()  // topic count
+	dec.ReadString() // topic name
+	dec.ReadInt32()  // partition count
+	dec.ReadInt32()  // partition index
+	errCode, _ := dec.ReadInt16()
+	if errCode != 0 {
+		t.Errorf("error code = %d, want 0", errCode)
+	}
+	dec.ReadInt64() // timestamp
+	offset, _ := dec.ReadInt64()
+	if offset != 0 {
+		t.Errorf("earliest offset = %d, want 0", offset)
+	}
+}
+
+func TestHandler_ListOffsets_Latest_Empty(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	h, _ := newTestHandler(t)
+	go h.Handle(serverConn)
+
+	req := buildListOffsetsRequestFrame(56, "test", []protocol.ListOffsetsTopicRequest{
+		{TopicName: "events", Partitions: []protocol.ListOffsetsPartitionRequest{
+			{Partition: 0, Timestamp: protocol.TimestampLatest},
+		}},
+	})
+	clientConn.Write(req)
+
+	body := readResponse(t, clientConn)
+	dec := protocol.NewDecoder(bytes.NewReader(body))
+
+	dec.ReadInt32()  // correlationID
+	dec.ReadInt32()  // topic count
+	dec.ReadString() // topic name
+	dec.ReadInt32()  // partition count
+	dec.ReadInt32()  // partition index
+	errCode, _ := dec.ReadInt16()
+	if errCode != 0 {
+		t.Errorf("error code = %d, want 0", errCode)
+	}
+	dec.ReadInt64() // timestamp
+	offset, _ := dec.ReadInt64()
+	if offset != 0 {
+		t.Errorf("latest offset on empty partition = %d, want 0", offset)
+	}
+}
+
+func TestHandler_ListOffsets_Latest_AfterProduce(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	h, _ := newTestHandler(t)
+	go h.Handle(serverConn)
+
+	// Produce one message so the partition has non-zero size.
+	produceFrame := buildProduceRequestFrame(1, "test", protocol.AcksLeader, []protocol.ProduceTopicData{
+		{TopicName: "events", Partitions: []protocol.ProducePartitionData{
+			{Partition: 0, RecordBatch: []byte("hello")},
+		}},
+	})
+	clientConn.Write(produceFrame)
+	readResponse(t, clientConn) // consume Produce response
+
+	// Now query latest offset.
+	req := buildListOffsetsRequestFrame(57, "test", []protocol.ListOffsetsTopicRequest{
+		{TopicName: "events", Partitions: []protocol.ListOffsetsPartitionRequest{
+			{Partition: 0, Timestamp: protocol.TimestampLatest},
+		}},
+	})
+	clientConn.Write(req)
+
+	body := readResponse(t, clientConn)
+	dec := protocol.NewDecoder(bytes.NewReader(body))
+
+	dec.ReadInt32()  // correlationID
+	dec.ReadInt32()  // topic count
+	dec.ReadString() // topic name
+	dec.ReadInt32()  // partition count
+	dec.ReadInt32()  // partition index
+	errCode, _ := dec.ReadInt16()
+	if errCode != 0 {
+		t.Errorf("error code = %d, want 0", errCode)
+	}
+	dec.ReadInt64() // timestamp
+	offset, _ := dec.ReadInt64()
+	if offset <= 0 {
+		t.Errorf("latest offset after produce = %d, want > 0", offset)
 	}
 }
