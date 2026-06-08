@@ -86,6 +86,8 @@ func (h *Handler) dispatch(conn net.Conn, dec *protocol.Decoder, header *protoco
 		return h.handleProduce(conn, dec, header)
 	case protocol.ApiKeyFetch:
 		return h.handleFetch(conn, dec, header)
+	case protocol.ApiKeyListOffsets:
+		return h.handleListOffsets(conn, dec, header)
 	case protocol.ApiKeyMetadata:
 		return h.handleMetadata(conn, dec, header)
 	case protocol.ApiKeyOffsetCommit:
@@ -674,6 +676,64 @@ func encodeOffsetKey(groupID, topic string, partition int32) []byte {
 	pos += len(topic)
 	binary.BigEndian.PutUint32(buf[pos:], uint32(partition))
 	return buf
+}
+
+// handleListOffsets processes a ListOffsetsRequest (ApiKey 2, v1).
+//
+// Timestamp semantics:
+//   - -2 (Earliest): always returns offset 0.
+//   - -1 (Latest):   returns ps.Size(), the byte offset of the next write,
+//     which acts as the high-watermark for new consumers.
+func (h *Handler) handleListOffsets(conn net.Conn, dec *protocol.Decoder, header *protocol.RequestHeader) error {
+	req, err := dec.ParseListOffsetsRequest(header)
+	if err != nil {
+		return fmt.Errorf("handleListOffsets: parse: %w", err)
+	}
+
+	resp := &protocol.ListOffsetsResponse{
+		Topics: make([]protocol.ListOffsetsTopicResponse, 0, len(req.Topics)),
+	}
+
+	for _, topic := range req.Topics {
+		topicResp := protocol.ListOffsetsTopicResponse{
+			TopicName:  topic.TopicName,
+			Partitions: make([]protocol.ListOffsetsPartitionResponse, 0, len(topic.Partitions)),
+		}
+
+		for _, part := range topic.Partitions {
+			partResp := protocol.ListOffsetsPartitionResponse{
+				Partition: part.Partition,
+				Timestamp: -1,
+			}
+
+			switch part.Timestamp {
+			case protocol.TimestampEarliest:
+				partResp.Offset = 0
+			case protocol.TimestampLatest:
+				ps, err := h.store.GetOrCreatePartition(topic.TopicName, part.Partition)
+				if err != nil {
+					h.logger.Error("handleListOffsets: get partition",
+						"topic", topic.TopicName, "partition", part.Partition, "error", err)
+					partResp.ErrorCode = protocol.ErrCodeUnknownTopicOrPartition
+				} else {
+					partResp.Offset = ps.Size()
+				}
+			default:
+				// Unsupported timestamp query — return earliest as a safe fallback.
+				partResp.Offset = 0
+			}
+
+			topicResp.Partitions = append(topicResp.Partitions, partResp)
+		}
+		resp.Topics = append(resp.Topics, topicResp)
+	}
+
+	enc := protocol.NewEncoder()
+	enc.EncodeListOffsetsResponse(header.CorrelationID, resp)
+	if _, err := conn.Write(enc.FullMessage()); err != nil {
+		return fmt.Errorf("handleListOffsets: write response: %w", err)
+	}
+	return nil
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
