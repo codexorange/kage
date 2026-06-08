@@ -9,6 +9,7 @@ import (
 const (
 	ApiKeyProduce         int16 = 0
 	ApiKeyFetch           int16 = 1
+	ApiKeyListOffsets     int16 = 2
 	ApiKeyMetadata        int16 = 3
 	ApiKeyOffsetCommit    int16 = 8
 	ApiKeyOffsetFetch     int16 = 9
@@ -449,9 +450,10 @@ func (d *Decoder) ParseFetchRequest(header *RequestHeader) (*FetchRequest, error
 
 // Kafka error codes used in responses.
 const (
-	ErrCodeNone             int16 = 0
-	ErrCodeOffsetOutOfRange int16 = 1
-	ErrCodeCorruptMessage   int16 = 2
+	ErrCodeNone                    int16 = 0
+	ErrCodeOffsetOutOfRange        int16 = 1
+	ErrCodeCorruptMessage          int16 = 2
+	ErrCodeUnknownTopicOrPartition int16 = 3
 )
 
 // FetchPartitionResponse holds the result for one fetched partition.
@@ -814,6 +816,142 @@ func (e *Encoder) EncodeOffsetFetchResponse(correlationID int32, resp *OffsetFet
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// ListOffsets (ApiKey 2, v1)
+// ──────────────────────────────────────────────────────────────────────────────
+
+// Timestamp sentinel values used in ListOffsetsRequest.
+const (
+	TimestampEarliest int64 = -2 // fetch offset of the first available message
+	TimestampLatest   int64 = -1 // fetch offset of the next message to be written
+)
+
+// ListOffsetsPartitionRequest is one partition entry inside a ListOffsetsRequest.
+type ListOffsetsPartitionRequest struct {
+	Partition int32
+	Timestamp int64 // -2 = earliest, -1 = latest
+}
+
+// ListOffsetsTopicRequest groups partitions under a single topic name.
+type ListOffsetsTopicRequest struct {
+	TopicName  string
+	Partitions []ListOffsetsPartitionRequest
+}
+
+// ListOffsetsRequest (v1) wire layout after the request header:
+//
+//	ReplicaId  int32
+//	topics[]
+//	  TopicName  string
+//	  partitions[]
+//	    Partition  int32
+//	    Timestamp  int64
+type ListOffsetsRequest struct {
+	Header    *RequestHeader
+	ReplicaID int32
+	Topics    []ListOffsetsTopicRequest
+}
+
+// ParseListOffsetsRequest decodes a ListOffsetsRequest (v1) body.
+func (d *Decoder) ParseListOffsetsRequest(header *RequestHeader) (*ListOffsetsRequest, error) {
+	replicaID, err := d.ReadInt32()
+	if err != nil {
+		return nil, fmt.Errorf("list offsets request: read replica_id: %w", err)
+	}
+
+	topicCount, err := d.ReadInt32()
+	if err != nil {
+		return nil, fmt.Errorf("list offsets request: read topic count: %w", err)
+	}
+	if topicCount < 0 || topicCount > 1024 {
+		return nil, fmt.Errorf("list offsets request: invalid topic count %d", topicCount)
+	}
+
+	topics := make([]ListOffsetsTopicRequest, 0, topicCount)
+	for i := int32(0); i < topicCount; i++ {
+		topicName, err := d.ReadString()
+		if err != nil {
+			return nil, fmt.Errorf("list offsets request: topic[%d] name: %w", i, err)
+		}
+
+		partCount, err := d.ReadInt32()
+		if err != nil {
+			return nil, fmt.Errorf("list offsets request: topic[%d] partition count: %w", i, err)
+		}
+		if partCount < 0 || partCount > 1024 {
+			return nil, fmt.Errorf("list offsets request: topic[%d] invalid partition count %d", i, partCount)
+		}
+
+		partitions := make([]ListOffsetsPartitionRequest, 0, partCount)
+		for j := int32(0); j < partCount; j++ {
+			partition, err := d.ReadInt32()
+			if err != nil {
+				return nil, fmt.Errorf("list offsets request: topic[%d] partition[%d] index: %w", i, j, err)
+			}
+			timestamp, err := d.ReadInt64()
+			if err != nil {
+				return nil, fmt.Errorf("list offsets request: topic[%d] partition[%d] timestamp: %w", i, j, err)
+			}
+			partitions = append(partitions, ListOffsetsPartitionRequest{
+				Partition: partition,
+				Timestamp: timestamp,
+			})
+		}
+		topics = append(topics, ListOffsetsTopicRequest{
+			TopicName:  topicName,
+			Partitions: partitions,
+		})
+	}
+
+	return &ListOffsetsRequest{Header: header, ReplicaID: replicaID, Topics: topics}, nil
+}
+
+// ListOffsetsPartitionResponse is the result for one partition.
+type ListOffsetsPartitionResponse struct {
+	Partition int32
+	ErrorCode int16
+	Timestamp int64 // always -1 in our implementation
+	Offset    int64
+}
+
+// ListOffsetsTopicResponse groups partition results under a topic.
+type ListOffsetsTopicResponse struct {
+	TopicName  string
+	Partitions []ListOffsetsPartitionResponse
+}
+
+// ListOffsetsResponse holds the full response.
+type ListOffsetsResponse struct {
+	Topics []ListOffsetsTopicResponse
+}
+
+// EncodeListOffsetsResponse serialises a ListOffsetsResponse (v1) into the Encoder.
+//
+// Wire layout:
+//
+//	CorrelationID  int32
+//	topics[]       int32
+//	  TopicName    string
+//	  partitions[] int32
+//	    Partition  int32
+//	    ErrorCode  int16
+//	    Timestamp  int64
+//	    Offset     int64
+func (e *Encoder) EncodeListOffsetsResponse(correlationID int32, resp *ListOffsetsResponse) {
+	e.WriteInt32(correlationID)
+	e.WriteInt32(int32(len(resp.Topics)))
+	for _, t := range resp.Topics {
+		e.WriteString(t.TopicName)
+		e.WriteInt32(int32(len(t.Partitions)))
+		for _, p := range t.Partitions {
+			e.WriteInt32(p.Partition)
+			e.WriteInt16(p.ErrorCode)
+			e.WriteInt64(p.Timestamp)
+			e.WriteInt64(p.Offset)
+		}
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // ApiVersionsResponse (ApiKey 18, v0)
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -825,12 +963,12 @@ type apiVersion struct {
 }
 
 // supportedAPIVersions is the static capability table advertised to clients.
-// Produce is advertised at v3 so that kafkajs sends RecordBatch v2 (magic byte 2)
-// payloads. v3 adds transactional_id (nullable string) before Acks; ParseProduceRequest
-// reads and discards it when header.ApiVersion >= 3.
+// Versions are capped to what our parsers/encoders actually implement to prevent
+// byte-alignment bugs when clients negotiate higher versions than we support.
 var supportedAPIVersions = []apiVersion{
-	{Key: ApiKeyProduce, MinVersion: 0, MaxVersion: 3},
-	{Key: ApiKeyFetch, MinVersion: 0, MaxVersion: 11},
+	{Key: ApiKeyProduce, MinVersion: 0, MaxVersion: 3},  // v3: transactional_id + RecordBatch magic 2
+	{Key: ApiKeyFetch, MinVersion: 0, MaxVersion: 4},    // capped: handleFetch implements v4 layout
+	{Key: ApiKeyListOffsets, MinVersion: 0, MaxVersion: 1},
 	{Key: ApiKeyMetadata, MinVersion: 0, MaxVersion: 9},
 	{Key: ApiKeyOffsetCommit, MinVersion: 0, MaxVersion: 2},
 	{Key: ApiKeyOffsetFetch, MinVersion: 0, MaxVersion: 1},

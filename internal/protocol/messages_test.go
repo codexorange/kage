@@ -321,3 +321,113 @@ func TestEncodeMetadataResponse(t *testing.T) {
 		t.Errorf("offline replicas count = %d, want 0", offlineCount)
 	}
 }
+
+// ── ListOffsets protocol tests ─────────────────────────────────────────────────
+
+func buildListOffsetsRequestBody(replicaID int32, topics []ListOffsetsTopicRequest) []byte {
+	var buf bytes.Buffer
+	binary.Write(&buf, binary.BigEndian, replicaID)
+	binary.Write(&buf, binary.BigEndian, int32(len(topics)))
+	for _, t := range topics {
+		binary.Write(&buf, binary.BigEndian, int16(len(t.TopicName)))
+		buf.WriteString(t.TopicName)
+		binary.Write(&buf, binary.BigEndian, int32(len(t.Partitions)))
+		for _, p := range t.Partitions {
+			binary.Write(&buf, binary.BigEndian, p.Partition)
+			binary.Write(&buf, binary.BigEndian, p.Timestamp)
+		}
+	}
+	return buf.Bytes()
+}
+
+func TestParseListOffsetsRequest_Earliest(t *testing.T) {
+	topics := []ListOffsetsTopicRequest{
+		{TopicName: "events", Partitions: []ListOffsetsPartitionRequest{{Partition: 0, Timestamp: TimestampEarliest}}},
+	}
+	body := buildListOffsetsRequestBody(-1, topics)
+	req, err := NewDecoder(bytes.NewReader(body)).ParseListOffsetsRequest(&RequestHeader{ApiVersion: 1})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if req.ReplicaID != -1 {
+		t.Errorf("ReplicaID = %d, want -1", req.ReplicaID)
+	}
+	if len(req.Topics) != 1 {
+		t.Fatalf("topics = %d, want 1", len(req.Topics))
+	}
+	if req.Topics[0].TopicName != "events" {
+		t.Errorf("topic name = %q, want %q", req.Topics[0].TopicName, "events")
+	}
+	if req.Topics[0].Partitions[0].Timestamp != TimestampEarliest {
+		t.Errorf("timestamp = %d, want %d", req.Topics[0].Partitions[0].Timestamp, TimestampEarliest)
+	}
+}
+
+func TestParseListOffsetsRequest_Latest(t *testing.T) {
+	topics := []ListOffsetsTopicRequest{
+		{TopicName: "logs", Partitions: []ListOffsetsPartitionRequest{{Partition: 2, Timestamp: TimestampLatest}}},
+	}
+	body := buildListOffsetsRequestBody(-1, topics)
+	req, err := NewDecoder(bytes.NewReader(body)).ParseListOffsetsRequest(&RequestHeader{ApiVersion: 1})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if req.Topics[0].Partitions[0].Timestamp != TimestampLatest {
+		t.Errorf("timestamp = %d, want %d", req.Topics[0].Partitions[0].Timestamp, TimestampLatest)
+	}
+	if req.Topics[0].Partitions[0].Partition != 2 {
+		t.Errorf("partition = %d, want 2", req.Topics[0].Partitions[0].Partition)
+	}
+}
+
+func TestEncodeListOffsetsResponse(t *testing.T) {
+	resp := &ListOffsetsResponse{
+		Topics: []ListOffsetsTopicResponse{
+			{
+				TopicName: "events",
+				Partitions: []ListOffsetsPartitionResponse{
+					{Partition: 0, ErrorCode: 0, Timestamp: -1, Offset: 42},
+				},
+			},
+		},
+	}
+	enc := NewEncoder()
+	enc.EncodeListOffsetsResponse(77, resp)
+	raw := enc.FullMessage()
+
+	dec := NewDecoder(bytes.NewReader(raw))
+	dec.ReadInt32() // size prefix
+
+	corrID, _ := dec.ReadInt32()
+	if corrID != 77 {
+		t.Errorf("correlationID = %d, want 77", corrID)
+	}
+	topicCount, _ := dec.ReadInt32()
+	if topicCount != 1 {
+		t.Fatalf("topic count = %d, want 1", topicCount)
+	}
+	topicName, _ := dec.ReadString()
+	if topicName != "events" {
+		t.Errorf("topic name = %q, want %q", topicName, "events")
+	}
+	partCount, _ := dec.ReadInt32()
+	if partCount != 1 {
+		t.Fatalf("partition count = %d, want 1", partCount)
+	}
+	partition, _ := dec.ReadInt32()
+	if partition != 0 {
+		t.Errorf("partition = %d, want 0", partition)
+	}
+	errCode, _ := dec.ReadInt16()
+	if errCode != 0 {
+		t.Errorf("error code = %d, want 0", errCode)
+	}
+	ts, _ := dec.ReadInt64()
+	if ts != -1 {
+		t.Errorf("timestamp = %d, want -1", ts)
+	}
+	offset, _ := dec.ReadInt64()
+	if offset != 42 {
+		t.Errorf("offset = %d, want 42", offset)
+	}
+}
