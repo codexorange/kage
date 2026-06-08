@@ -6,12 +6,12 @@ import (
 	"testing"
 )
 
-// buildProduceRequestBody encodes a ProduceRequest v2 body (after the header).
-// v2 layout: Acks(int16) | TimeoutMs(int32) | topics[]
-// (No transactional_id — that field was introduced in v3.)
+// buildProduceRequestBody encodes a ProduceRequest v3 body (after the header).
+// v3 layout: TransactionalId(nullable string, -1=null) | Acks(int16) | TimeoutMs(int32) | topics[]
 func buildProduceRequestBody(acks int16, timeoutMs int32, topics []ProduceTopicData) []byte {
 	var buf bytes.Buffer
 
+	binary.Write(&buf, binary.BigEndian, int16(-1)) // transactional_id: null
 	binary.Write(&buf, binary.BigEndian, acks)
 	binary.Write(&buf, binary.BigEndian, timeoutMs)
 	binary.Write(&buf, binary.BigEndian, int32(len(topics)))
@@ -41,7 +41,7 @@ func TestParseProduceRequest_SingleTopicPartition(t *testing.T) {
 		},
 	}
 	body := buildProduceRequestBody(AcksLeader, 5000, topics)
-	hdr := &RequestHeader{ApiKey: ApiKeyProduce}
+	hdr := &RequestHeader{ApiKey: ApiKeyProduce, ApiVersion: 3}
 
 	req, err := NewDecoder(bytes.NewReader(body)).ParseProduceRequest(hdr)
 	if err != nil {
@@ -75,7 +75,7 @@ func TestParseProduceRequest_AcksNone(t *testing.T) {
 	body := buildProduceRequestBody(AcksNone, 1000, []ProduceTopicData{
 		{TopicName: "t", Partitions: []ProducePartitionData{{Partition: 0, RecordBatch: []byte("data")}}},
 	})
-	req, err := NewDecoder(bytes.NewReader(body)).ParseProduceRequest(&RequestHeader{})
+	req, err := NewDecoder(bytes.NewReader(body)).ParseProduceRequest(&RequestHeader{ApiVersion: 3})
 	if err != nil {
 		t.Fatalf("ParseProduceRequest: %v", err)
 	}
@@ -88,7 +88,7 @@ func TestParseProduceRequest_AcksAll(t *testing.T) {
 	body := buildProduceRequestBody(AcksAll, 1000, []ProduceTopicData{
 		{TopicName: "t", Partitions: []ProducePartitionData{{Partition: 0, RecordBatch: []byte("x")}}},
 	})
-	req, err := NewDecoder(bytes.NewReader(body)).ParseProduceRequest(&RequestHeader{})
+	req, err := NewDecoder(bytes.NewReader(body)).ParseProduceRequest(&RequestHeader{ApiVersion: 3})
 	if err != nil {
 		t.Fatalf("ParseProduceRequest: %v", err)
 	}
@@ -114,7 +114,7 @@ func TestParseProduceRequest_MultipleTopicsAndPartitions(t *testing.T) {
 		},
 	}
 	body := buildProduceRequestBody(AcksLeader, 5000, topics)
-	req, err := NewDecoder(bytes.NewReader(body)).ParseProduceRequest(&RequestHeader{})
+	req, err := NewDecoder(bytes.NewReader(body)).ParseProduceRequest(&RequestHeader{ApiVersion: 3})
 	if err != nil {
 		t.Fatalf("ParseProduceRequest: %v", err)
 	}
@@ -133,7 +133,7 @@ func TestParseProduceRequest_EmptyBatch(t *testing.T) {
 	body := buildProduceRequestBody(AcksLeader, 1000, []ProduceTopicData{
 		{TopicName: "t", Partitions: []ProducePartitionData{{Partition: 0, RecordBatch: []byte{}}}},
 	})
-	req, err := NewDecoder(bytes.NewReader(body)).ParseProduceRequest(&RequestHeader{})
+	req, err := NewDecoder(bytes.NewReader(body)).ParseProduceRequest(&RequestHeader{ApiVersion: 3})
 	if err != nil {
 		t.Fatalf("ParseProduceRequest with empty batch: %v", err)
 	}
@@ -142,9 +142,59 @@ func TestParseProduceRequest_EmptyBatch(t *testing.T) {
 	}
 }
 
+func TestParseProduceRequest_V3_NonNullTransactionalId(t *testing.T) {
+	// Build a v3 body with a real (non-null) transactional_id.
+	var buf bytes.Buffer
+	txnID := "my-txn"
+	binary.Write(&buf, binary.BigEndian, int16(len(txnID)))
+	buf.WriteString(txnID)
+	binary.Write(&buf, binary.BigEndian, AcksLeader)
+	binary.Write(&buf, binary.BigEndian, int32(5000))
+	binary.Write(&buf, binary.BigEndian, int32(1)) // 1 topic
+	binary.Write(&buf, binary.BigEndian, int16(1))
+	buf.WriteByte('t')
+	binary.Write(&buf, binary.BigEndian, int32(1)) // 1 partition
+	binary.Write(&buf, binary.BigEndian, int32(0)) // partition index
+	binary.Write(&buf, binary.BigEndian, int32(3)) // batch size
+	buf.WriteString("abc")
+
+	req, err := NewDecoder(&buf).ParseProduceRequest(&RequestHeader{ApiVersion: 3})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if req.Acks != AcksLeader {
+		t.Errorf("Acks = %d, want %d", req.Acks, AcksLeader)
+	}
+	if len(req.Topics) != 1 || req.Topics[0].TopicName != "t" {
+		t.Errorf("unexpected topics: %+v", req.Topics)
+	}
+}
+
+func TestParseProduceRequest_V2_NoTransactionalId(t *testing.T) {
+	// v2 body: no transactional_id prefix.
+	var buf bytes.Buffer
+	binary.Write(&buf, binary.BigEndian, AcksLeader)
+	binary.Write(&buf, binary.BigEndian, int32(1000))
+	binary.Write(&buf, binary.BigEndian, int32(1))
+	binary.Write(&buf, binary.BigEndian, int16(1))
+	buf.WriteByte('x')
+	binary.Write(&buf, binary.BigEndian, int32(1))
+	binary.Write(&buf, binary.BigEndian, int32(0))
+	binary.Write(&buf, binary.BigEndian, int32(1))
+	buf.WriteByte('z')
+
+	req, err := NewDecoder(&buf).ParseProduceRequest(&RequestHeader{ApiVersion: 2})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if req.Acks != AcksLeader {
+		t.Errorf("Acks = %d, want %d", req.Acks, AcksLeader)
+	}
+}
+
 func TestParseProduceRequest_Truncated(t *testing.T) {
 	d := NewDecoder(bytes.NewReader([]byte{0x00}))
-	_, err := d.ParseProduceRequest(&RequestHeader{})
+	_, err := d.ParseProduceRequest(&RequestHeader{ApiVersion: 3})
 	if err == nil {
 		t.Fatal("expected error on truncated input, got nil")
 	}
