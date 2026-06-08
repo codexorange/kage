@@ -190,6 +190,9 @@ func (d *Decoder) ParseProduceRequest(header *RequestHeader) (*ProduceRequest, e
 	if err != nil {
 		return nil, fmt.Errorf("produce request: read topic count: %w", err)
 	}
+	if topicCount < 0 || topicCount > 1024 {
+		return nil, fmt.Errorf("produce request: invalid topic count %d", topicCount)
+	}
 
 	topics := make([]ProduceTopicData, 0, topicCount)
 	for i := int32(0); i < topicCount; i++ {
@@ -201,6 +204,9 @@ func (d *Decoder) ParseProduceRequest(header *RequestHeader) (*ProduceRequest, e
 		partCount, err := d.ReadInt32()
 		if err != nil {
 			return nil, fmt.Errorf("produce request: topic[%d] partition count: %w", i, err)
+		}
+		if partCount < 0 || partCount > 1024 {
+			return nil, fmt.Errorf("produce request: topic[%d] invalid partition count %d", i, partCount)
 		}
 
 		partitions := make([]ProducePartitionData, 0, partCount)
