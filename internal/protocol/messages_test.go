@@ -263,10 +263,10 @@ func TestEncodeMetadataResponse_V6(t *testing.T) {
 	if leaderID != 1 {
 		t.Errorf("leader_id = %d, want 1", leaderID)
 	}
-	dec.ReadInt32() // replica count
-	dec.ReadInt32() // replica node
-	dec.ReadInt32() // isr count
-	dec.ReadInt32() // isr node
+	dec.ReadInt32()                    // replica count
+	dec.ReadInt32()                    // replica node
+	dec.ReadInt32()                    // isr count
+	dec.ReadInt32()                    // isr node
 	offlineCount, _ := dec.ReadInt32() // offlineReplicas (v5+)
 	if offlineCount != 0 {
 		t.Errorf("offline replicas count = %d, want 0", offlineCount)
