@@ -473,7 +473,7 @@ func (h *Handler) handleMetadata(conn net.Conn, dec *protocol.Decoder, header *p
 	}
 
 	enc := protocol.NewEncoder()
-	enc.EncodeMetadataResponse(header.CorrelationID, resp)
+	enc.EncodeMetadataResponse(header.CorrelationID, header.ApiVersion, resp)
 	if _, err = conn.Write(enc.FullMessage()); err != nil {
 		return fmt.Errorf("handleMetadata: failed to write response: %w", err)
 	}
