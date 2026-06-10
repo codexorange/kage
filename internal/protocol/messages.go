@@ -1327,55 +1327,48 @@ func (e *Encoder) EncodeSyncGroupResponse(correlationID int32, assignment []byte
 }
 
 // EncodeMetadataResponse encodes a MetadataResponse into the Encoder.
-// Wire layout (v6):
 //
-//	CorrelationID      int32
-//	ThrottleTimeMs     int32
-//	brokers[]          int32 (array length)
-//	  NodeID           int32
-//	  Host             string  (int16 len + bytes)
-//	  Port             int32
-//	  Rack             nullable string (int16 = -1 for null)
-//	ClusterID          nullable string (int16 = -1 for null)
-//	ControllerID       int32
-//	topics[]           int32 (array length)
-//	  ErrorCode        int16
-//	  Name             string  (int16 len + bytes)
-//	  IsInternal       int8 (0=false)
-//	  partitions[]     int32 (array length)
-//	    ErrorCode      int16
-//	    PartitionIndex int32
-//	    LeaderID       int32
-//	    replicas[]     int32 (array length)
-//	      NodeID       int32
-//	    isr[]          int32 (array length)
-//	      NodeID       int32
-//	    offlineReplicas[] int32 (array length)
-//	      NodeID       int32
-func (e *Encoder) EncodeMetadataResponse(correlationID int32, resp *MetadataResponse) {
+// The wire layout is version-dependent. Fields are added progressively:
+//
+//	v0:  CorrelationID | brokers[] (NodeID Host Port) | topics[] (ErrorCode Name partitions[])
+//	v1+: + Rack per broker | ControllerID | IsInternal per topic
+//	v2+: + ClusterID (nullable string, before ControllerID)
+//	v3+: + ThrottleTimeMs (after CorrelationID)
+//	v5+: + offlineReplicas[] per partition
+func (e *Encoder) EncodeMetadataResponse(correlationID int32, version int16, resp *MetadataResponse) {
 	e.WriteInt32(correlationID)
-	e.WriteInt32(0) // ThrottleTimeMs
+	if version >= 3 {
+		e.WriteInt32(0) // ThrottleTimeMs
+	}
 
 	e.WriteInt32(int32(len(resp.Brokers)))
 	for _, b := range resp.Brokers {
 		e.WriteInt32(b.NodeID)
 		e.WriteString(b.Host)
 		e.WriteInt32(b.Port)
-		e.WriteNullableString(b.Rack)
+		if version >= 1 {
+			e.WriteNullableString(b.Rack)
+		}
 	}
 
-	e.WriteNullableString(resp.ClusterID)
-	e.WriteInt32(resp.ControllerID)
+	if version >= 2 {
+		e.WriteNullableString(resp.ClusterID)
+	}
+	if version >= 1 {
+		e.WriteInt32(resp.ControllerID)
+	}
 
 	e.WriteInt32(int32(len(resp.Topics)))
 	for _, t := range resp.Topics {
 		e.WriteInt16(t.ErrorCode)
 		e.WriteString(t.Name)
-		isInternal := int8(0)
-		if t.IsInternal {
-			isInternal = 1
+		if version >= 1 {
+			isInternal := int8(0)
+			if t.IsInternal {
+				isInternal = 1
+			}
+			e.WriteInt8(isInternal)
 		}
-		e.WriteInt8(isInternal)
 		e.WriteInt32(int32(len(t.Partitions)))
 		for _, p := range t.Partitions {
 			e.WriteInt16(p.ErrorCode)
@@ -1389,9 +1382,11 @@ func (e *Encoder) EncodeMetadataResponse(correlationID int32, resp *MetadataResp
 			for _, r := range p.Isr {
 				e.WriteInt32(r)
 			}
-			e.WriteInt32(int32(len(p.OfflineReplicas)))
-			for _, r := range p.OfflineReplicas {
-				e.WriteInt32(r)
+			if version >= 5 {
+				e.WriteInt32(int32(len(p.OfflineReplicas)))
+				for _, r := range p.OfflineReplicas {
+					e.WriteInt32(r)
+				}
 			}
 		}
 	}

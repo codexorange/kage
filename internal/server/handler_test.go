@@ -76,12 +76,20 @@ func buildRequestHeader(apiKey, apiVersion int16, correlationID int32, clientID 
 
 // buildMetadataRequestFrame builds a complete on-wire MetadataRequest frame.
 func buildMetadataRequestFrame(correlationID int32, clientID string, topics []string) []byte {
+	return buildMetadataRequestFrameV(correlationID, clientID, topics, 6)
+}
+
+// buildMetadataRequestFrameV builds a MetadataRequest frame with the given API version.
+func buildMetadataRequestFrameV(correlationID int32, clientID string, topics []string, version int16) []byte {
 	var body bytes.Buffer
-	body.Write(buildRequestHeader(protocol.ApiKeyMetadata, 0, correlationID, clientID))
+	body.Write(buildRequestHeader(protocol.ApiKeyMetadata, version, correlationID, clientID))
 	binary.Write(&body, binary.BigEndian, int32(len(topics)))
 	for _, t := range topics {
 		binary.Write(&body, binary.BigEndian, int16(len(t)))
 		body.WriteString(t)
+	}
+	if version >= 4 {
+		body.WriteByte(1) // allow_auto_topic_creation = true
 	}
 	return buildFrame(body.Bytes())
 }

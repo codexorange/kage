@@ -180,7 +180,7 @@ func TestParseMetadataRequest_Truncated(t *testing.T) {
 	}
 }
 
-func TestEncodeMetadataResponse(t *testing.T) {
+func TestEncodeMetadataResponse_V6(t *testing.T) {
 	resp := &MetadataResponse{
 		Brokers:      []Broker{{NodeID: 1, Host: "localhost", Port: 9092, Rack: nil}},
 		ClusterID:    nil,
@@ -198,38 +198,20 @@ func TestEncodeMetadataResponse(t *testing.T) {
 	}
 
 	enc := NewEncoder()
-	enc.EncodeMetadataResponse(42, resp)
+	enc.EncodeMetadataResponse(42, 6, resp)
 	raw := enc.FullMessage()
 
-	if len(raw) < 4 {
-		t.Fatalf("encoded response too short: %d bytes", len(raw))
-	}
-
-	// Parse the v6 wire layout.
 	dec := NewDecoder(bytes.NewReader(raw))
+	dec.ReadInt32() // size prefix
 
-	// 4-byte size prefix.
-	size, _ := dec.ReadInt32()
-	if size <= 0 {
-		t.Fatalf("size prefix = %d, want > 0", size)
-	}
-
-	// CorrelationID.
-	corrID, err := dec.ReadInt32()
-	if err != nil {
-		t.Fatalf("failed to read correlationID: %v", err)
-	}
+	corrID, _ := dec.ReadInt32()
 	if corrID != 42 {
 		t.Errorf("correlationID = %d, want 42", corrID)
 	}
-
-	// ThrottleTimeMs (v1+).
-	throttle, _ := dec.ReadInt32()
+	throttle, _ := dec.ReadInt32() // ThrottleTimeMs (v3+)
 	if throttle != 0 {
 		t.Errorf("throttle_time_ms = %d, want 0", throttle)
 	}
-
-	// Broker count.
 	brokerCount, _ := dec.ReadInt32()
 	if brokerCount != 1 {
 		t.Errorf("broker count = %d, want 1", brokerCount)
@@ -246,80 +228,116 @@ func TestEncodeMetadataResponse(t *testing.T) {
 	if port != 9092 {
 		t.Errorf("broker port = %d, want 9092", port)
 	}
-	// Rack: nullable string, -1 means null.
-	rackLen, _ := dec.ReadInt16()
+	rackLen, _ := dec.ReadInt16() // Rack nullable (v1+)
 	if rackLen != -1 {
 		t.Errorf("broker rack length = %d, want -1 (null)", rackLen)
 	}
-
-	// ClusterID: nullable string (v2+), -1 means null.
-	clusterIDLen, _ := dec.ReadInt16()
+	clusterIDLen, _ := dec.ReadInt16() // ClusterID nullable (v2+)
 	if clusterIDLen != -1 {
 		t.Errorf("cluster_id length = %d, want -1 (null)", clusterIDLen)
 	}
-
-	// ControllerID (v1+).
-	controllerID, _ := dec.ReadInt32()
+	controllerID, _ := dec.ReadInt32() // ControllerID (v1+)
 	if controllerID != 1 {
 		t.Errorf("controller_id = %d, want 1", controllerID)
 	}
-
-	// Topic count.
 	topicCount, _ := dec.ReadInt32()
 	if topicCount != 1 {
 		t.Errorf("topic count = %d, want 1", topicCount)
 	}
-	topicErr, _ := dec.ReadInt16()
-	if topicErr != 0 {
-		t.Errorf("topic error = %d, want 0", topicErr)
-	}
+	dec.ReadInt16() // topic error code
 	topicName, _ := dec.ReadString()
 	if topicName != "kage-events" {
 		t.Errorf("topic name = %q, want %q", topicName, "kage-events")
 	}
-	// IsInternal (v1+): int8.
-	isInternal, _ := dec.ReadInt8()
+	isInternal, _ := dec.ReadInt8() // IsInternal (v1+)
 	if isInternal != 0 {
 		t.Errorf("is_internal = %d, want 0", isInternal)
 	}
-	// Partition count.
 	partCount, _ := dec.ReadInt32()
 	if partCount != 1 {
 		t.Errorf("partition count = %d, want 1", partCount)
 	}
-	// Partition fields.
-	partErr, _ := dec.ReadInt16()
-	if partErr != 0 {
-		t.Errorf("partition error = %d, want 0", partErr)
-	}
-	partIdx, _ := dec.ReadInt32()
-	if partIdx != 0 {
-		t.Errorf("partition index = %d, want 0", partIdx)
-	}
+	dec.ReadInt16() // partition error
+	dec.ReadInt32() // partition index
 	leaderID, _ := dec.ReadInt32()
 	if leaderID != 1 {
 		t.Errorf("leader_id = %d, want 1", leaderID)
 	}
-	replicaCount, _ := dec.ReadInt32()
-	if replicaCount != 1 {
-		t.Errorf("replica count = %d, want 1", replicaCount)
+	dec.ReadInt32() // replica count
+	dec.ReadInt32() // replica node
+	dec.ReadInt32() // isr count
+	dec.ReadInt32() // isr node
+	offlineCount, _ := dec.ReadInt32() // offlineReplicas (v5+)
+	if offlineCount != 0 {
+		t.Errorf("offline replicas count = %d, want 0", offlineCount)
 	}
-	replicaNode, _ := dec.ReadInt32()
-	if replicaNode != 1 {
-		t.Errorf("replica node = %d, want 1", replicaNode)
+}
+
+func TestEncodeMetadataResponse_V0(t *testing.T) {
+	// v0 layout: no ThrottleTimeMs, no Rack, no ClusterID, no ControllerID,
+	// no IsInternal, no OfflineReplicas.
+	resp := &MetadataResponse{
+		Brokers:      []Broker{{NodeID: 7, Host: "kage", Port: 9092, Rack: nil}},
+		ClusterID:    nil,
+		ControllerID: 7,
+		Topics: []TopicMetadata{
+			{
+				Name:      "t",
+				ErrorCode: 0,
+				Partitions: []PartitionMetadata{
+					{ErrorCode: 0, Partition: 0, Leader: 7, Replicas: []int32{7}, Isr: []int32{7}},
+				},
+			},
+		},
 	}
+
+	enc := NewEncoder()
+	enc.EncodeMetadataResponse(1, 0, resp)
+	raw := enc.FullMessage()
+
+	dec := NewDecoder(bytes.NewReader(raw))
+	dec.ReadInt32() // size prefix
+
+	corrID, _ := dec.ReadInt32()
+	if corrID != 1 {
+		t.Errorf("correlationID = %d, want 1", corrID)
+	}
+	// No ThrottleTimeMs in v0 — next field is broker count.
+	brokerCount, _ := dec.ReadInt32()
+	if brokerCount != 1 {
+		t.Errorf("broker count = %d, want 1", brokerCount)
+	}
+	nodeID, _ := dec.ReadInt32()
+	if nodeID != 7 {
+		t.Errorf("broker NodeID = %d, want 7", nodeID)
+	}
+	dec.ReadString() // host
+	dec.ReadInt32()  // port
+	// No Rack in v0 — next field is topic count (no ClusterID/ControllerID either).
+	topicCount, _ := dec.ReadInt32()
+	if topicCount != 1 {
+		t.Errorf("topic count = %d, want 1", topicCount)
+	}
+	dec.ReadInt16() // topic error
+	name, _ := dec.ReadString()
+	if name != "t" {
+		t.Errorf("topic name = %q, want %q", name, "t")
+	}
+	// No IsInternal in v0 — next field is partition count.
+	partCount, _ := dec.ReadInt32()
+	if partCount != 1 {
+		t.Errorf("partition count = %d, want 1", partCount)
+	}
+	dec.ReadInt16() // partition error
+	dec.ReadInt32() // partition index
+	dec.ReadInt32() // leader
+	dec.ReadInt32() // replica count
+	dec.ReadInt32() // replica node
 	isrCount, _ := dec.ReadInt32()
 	if isrCount != 1 {
 		t.Errorf("isr count = %d, want 1", isrCount)
 	}
-	isrNode, _ := dec.ReadInt32()
-	if isrNode != 1 {
-		t.Errorf("isr node = %d, want 1", isrNode)
-	}
-	offlineCount, _ := dec.ReadInt32()
-	if offlineCount != 0 {
-		t.Errorf("offline replicas count = %d, want 0", offlineCount)
-	}
+	// No OfflineReplicas in v0 — stream ends here.
 }
 
 // ── ListOffsets protocol tests ─────────────────────────────────────────────────
